@@ -1,0 +1,39 @@
+services:
+  postgres:
+    image: postgres:17-bookworm
+    environment:
+      POSTGRES_USER: captcha
+      POSTGRES_PASSWORD: captcha-test-password
+      POSTGRES_DB: captcha_test
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U captcha -d captcha_test"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7.4-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--requirepass", "captcha-test-password"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "captcha-test-password", "--no-auth-warning", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+  tests:
+    build:
+      context: .
+      target: build
+    environment:
+      NODE_ENV: test
+      DATABASE_URL: postgresql://captcha:captcha-test-password@postgres:5432/captcha_test?schema=public
+      REDIS_URL: redis://:captcha-test-password@redis:6379
+      PUBLIC_BASE_URL: http://localhost:4100
+      SERVICE_MASTER_KEY: captcha-test-master-key-at-least-32-characters
+      ADMIN_JWT_SECRET: captcha-test-admin-key-at-least-32-characters
+    command: ["sh", "-c", "npm run db:deploy && npm run test:integration"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy

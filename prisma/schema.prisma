@@ -1,0 +1,84 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Admin {
+  id            String   @id @default(uuid())
+  username      String   @unique
+  password_hash String
+  created_at    DateTime @default(now())
+  updated_at    DateTime @updatedAt
+}
+
+model Site {
+  id               String   @id @default(uuid())
+  name             String
+  encrypted_secret String
+  allowed_origins  String
+  active           Boolean  @default(true)
+  created_at       DateTime @default(now())
+  updated_at       DateTime @updatedAt
+
+  sessions WidgetSession[]
+
+  @@index([active])
+}
+
+model WidgetSession {
+  id                      String   @id @default(uuid())
+  site_id                 String
+  token_digest            String   @unique
+  parent_origin           String
+  action                  String
+  username_digest         String
+  policy_version          Int
+  level                   String
+  credential_failure      Boolean  @default(false)
+  theme                    String   @default("light")
+  brand_color              String   @default("#2563eb")
+  risk_score               Int?
+  challenge_type           String?
+  challenge_answer_digest  String?
+  slider_target            Int?
+  challenge_digest         String?
+  completion_digest        String?  @unique
+  state                    String   @default("pending")
+  expires_at               DateTime
+  completed_at             DateTime?
+  redeemed_at              DateTime?
+  created_at               DateTime @default(now())
+
+  site Site @relation(fields: [site_id], references: [id], onDelete: Cascade)
+
+  @@index([site_id, created_at])
+  @@index([state, expires_at])
+}
+
+model ChallengeAsset {
+  id         String   @id @default(uuid())
+  kind       String
+  label      String
+  payload    String
+  active     Boolean  @default(true)
+  created_at DateTime @default(now())
+  updated_at DateTime @updatedAt
+
+  @@index([kind, active])
+}
+
+model SecurityEvent {
+  id         String   @id @default(uuid())
+  action     String
+  site_id    String?
+  session_id String?
+  metadata   String?
+  created_at DateTime @default(now())
+
+  @@index([action, created_at])
+  @@index([site_id])
+}

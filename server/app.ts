@@ -1,4 +1,5 @@
 import path from "node:path";
+import crypto from "node:crypto";
 import { fileURLToPath } from "node:url";
 import express, { type NextFunction, type Request, type Response } from "express";
 import helmet from "helmet";
@@ -20,10 +21,12 @@ import {
   type TrajectoryPoint,
 } from "./engine.js";
 import { renderCaptchaPng } from "./captcha-image.js";
+import { pingNonceStore } from "./nonce-store.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const webRoot = path.resolve(__dirname, "../web");
 const SESSION_TTL_MS = 5 * 60 * 1000;
+const MAX_CHALLENGE_ATTEMPTS = 5;
 const originSchema = z.string().url().refine((value) => new URL(value).origin === value, "Expected an origin without path, query or fragment");
 
 const sessionInput = z.object({
@@ -52,6 +55,31 @@ const verifyInput = z.object({
   answer: z.union([z.string().max(32), z.number()]),
   trajectory: z.array(z.object({ x: z.number(), y: z.number(), t: z.number() })).max(500).optional(),
 });
+
+const assetCreateInput = z.discriminatedUnion("kind", [
+  z.object({
+    kind: z.literal("text_wordlist"),
+    label: z.string().trim().min(1).max(100),
+    payload: z.string().min(1).max(100_000).refine(
+      (value) => {
+        const entries = value.split(/\r?\n/).map((item) => item.trim()).filter(Boolean);
+        return entries.length > 0 && entries.every((item) => /^\d{6}$/.test(item));
+      },
+      "Text wordlists must contain one six-digit challenge per line",
+    ),
+  }),
+  z.object({
+    kind: z.literal("slider_background"),
+    label: z.string().trim().min(1).max(100),
+    payload: z.string().min(1).max(100_000).regex(/^data:image\/(?:png|jpeg|webp);base64,[A-Za-z0-9+/=]+$/),
+  }),
+]);
+
+const assetUpdateInput = z.object({
+  label: z.string().trim().min(1).max(100).optional(),
+  payload: z.string().min(1).max(100_000).optional(),
+  active: z.boolean().optional(),
+}).refine((value) => value.label !== undefined || value.payload !== undefined || value.active !== undefined, "At least one field is required");
 
 function asyncRoute(handler: (req: Request, res: Response) => Promise<void>) {
   return (req: Request, res: Response, next: NextFunction) => handler(req, res).catch(next);
@@ -82,25 +110,50 @@ async function requireWidgetSession(req: Request, res: Response) {
   return session;
 }
 
-async function completeSession(id: string) {
+async function completeSession(id: string, challengeSummary?: string): Promise<string | null> {
   const completionToken = opaqueToken();
-  await prisma.widgetSession.update({
-    where: { id },
+  const completed = await prisma.widgetSession.updateMany({
+    where: { id, state: "pending" },
     data: {
       state: "completed",
       completion_digest: digest(completionToken),
       completed_at: new Date(),
+      challenge_digest: challengeSummary,
     },
   });
-  return completionToken;
+  return completed.count === 1 ? completionToken : null;
 }
 
-function textChallenge() {
-  const answer = randomTextAnswer();
+async function textChallenge() {
+  const assets = await prisma.challengeAsset.findMany({
+    where: { kind: "text_wordlist", active: true },
+    select: { payload: true },
+  });
+  const candidates = assets.flatMap((asset) => asset.payload.split(/\r?\n/).map((item) => item.trim()));
+  const answer = randomTextAnswer(candidates);
   return {
     answerDigest: challengeDigest(answer),
     imageData: `data:image/png;base64,${renderCaptchaPng(answer).toString("base64")}`,
   };
+}
+
+async function sliderBackground(): Promise<string | undefined> {
+  const assets = await prisma.challengeAsset.findMany({
+    where: { kind: "slider_background", active: true },
+    select: { payload: true },
+  });
+  return assets.length ? assets[crypto.randomInt(0, assets.length)].payload : undefined;
+}
+
+function validAssetPayload(kind: string, payload: string): boolean {
+  if (kind === "text_wordlist") {
+    const entries = payload.split(/\r?\n/).map((item) => item.trim()).filter(Boolean);
+    return entries.length > 0 && entries.every((item) => /^\d{6}$/.test(item));
+  }
+  if (kind === "slider_background") {
+    return /^data:image\/(?:png|jpeg|webp);base64,[A-Za-z0-9+/=]+$/.test(payload);
+  }
+  return false;
 }
 
 function frameAncestors(origin: string) {
@@ -113,11 +166,19 @@ export function createApp() {
   app.set("trust proxy", 1);
   app.use(helmet({ contentSecurityPolicy: false, frameguard: false, referrerPolicy: { policy: "no-referrer" } }));
   app.use(express.json({
-    limit: "64kb",
+    limit: "128kb",
     verify: (req, _res, buffer) => { (req as RawRequest).rawBody = Buffer.from(buffer); },
   }));
 
-  app.get("/health", (_req, res) => res.json({ status: "ok", timestamp: new Date().toISOString() }));
+  app.get("/health", asyncRoute(async (_req, res) => {
+    try {
+      const [, redisHealthy] = await Promise.all([prisma.$queryRaw`SELECT 1`, pingNonceStore()]);
+      if (!redisHealthy) throw new Error("Redis health check failed");
+      res.json({ status: "ok", database: "healthy", redis: "healthy", timestamp: new Date().toISOString() });
+    } catch {
+      res.status(503).json({ status: "unavailable", timestamp: new Date().toISOString() });
+    }
+  }));
 
   app.post("/v1/sites/:siteId/sessions", requireSiteSignature, asyncRoute(async (req: RawRequest, res) => {
     const input = sessionInput.parse(req.body);
@@ -157,14 +218,25 @@ export function createApp() {
   app.post("/v1/verifications/redeem", requireSiteSignature, asyncRoute(async (req: RawRequest, res) => {
     const input = z.object({ sessionRef: z.string().uuid(), token: z.string().min(20).max(256) }).parse(req.body);
     const session = await prisma.widgetSession.findUnique({ where: { id: input.sessionRef } });
-    if (
-      !session || session.site_id !== req.captchaSite!.id || session.state !== "completed" || session.redeemed_at ||
-      session.expires_at <= new Date() || !session.completion_digest || !safeEqual(session.completion_digest, digest(input.token))
-    ) {
+    if (!session || !session.completion_digest || !safeEqual(session.completion_digest, digest(input.token))) {
       res.status(400).json({ success: false });
       return;
     }
-    await prisma.widgetSession.update({ where: { id: session.id }, data: { state: "redeemed", redeemed_at: new Date() } });
+    const redeemed = await prisma.widgetSession.updateMany({
+      where: {
+        id: session.id,
+        site_id: req.captchaSite!.id,
+        state: "completed",
+        redeemed_at: null,
+        expires_at: { gt: new Date() },
+        completion_digest: digest(input.token),
+      },
+      data: { state: "redeemed", redeemed_at: new Date() },
+    });
+    if (redeemed.count !== 1) {
+      res.status(400).json({ success: false });
+      return;
+    }
     res.json({ success: true, sessionRef: session.id, policyVersion: session.policy_version });
   }));
 
@@ -193,29 +265,46 @@ export function createApp() {
       res.status(409).json({ error: "SESSION_ALREADY_COMPLETED" });
       return;
     }
+    if (session.state !== "pending" || session.challenge_attempts >= MAX_CHALLENGE_ATTEMPTS) {
+      res.status(429).json({ error: "CHALLENGE_ATTEMPTS_EXHAUSTED" });
+      return;
+    }
     const signals = evaluateInput.parse(req.body) as EnvironmentSignals;
     const riskScore = scoreEnvironment(signals);
     const decision = selectChallenge(session.level, riskScore, session.credential_failure);
     if (decision === "pass") {
       const completionToken = await completeSession(session.id);
+      if (!completionToken) {
+        res.status(409).json({ error: "SESSION_ALREADY_COMPLETED" });
+        return;
+      }
       res.json({ decision, completionToken, parentOrigin: session.parent_origin });
       return;
     }
     if (decision === "text") {
-      const challenge = textChallenge();
-      await prisma.widgetSession.update({
-        where: { id: session.id },
+      const challenge = await textChallenge();
+      const updated = await prisma.widgetSession.updateMany({
+        where: { id: session.id, state: "pending", challenge_attempts: { lt: MAX_CHALLENGE_ATTEMPTS } },
         data: { risk_score: riskScore, challenge_type: "text", challenge_answer_digest: challenge.answerDigest },
       });
+      if (updated.count !== 1) {
+        res.status(409).json({ error: "CHALLENGE_NOT_AVAILABLE" });
+        return;
+      }
       res.json({ decision, imageData: challenge.imageData, parentOrigin: session.parent_origin });
       return;
     }
     const target = randomSliderTarget();
-    await prisma.widgetSession.update({
-      where: { id: session.id },
+    const backgroundImage = await sliderBackground();
+    const updated = await prisma.widgetSession.updateMany({
+      where: { id: session.id, state: "pending", challenge_attempts: { lt: MAX_CHALLENGE_ATTEMPTS } },
       data: { risk_score: riskScore, challenge_type: "slider", slider_target: target },
     });
-    res.json({ decision, target, seed: opaqueToken(8), parentOrigin: session.parent_origin });
+    if (updated.count !== 1) {
+      res.status(409).json({ error: "CHALLENGE_NOT_AVAILABLE" });
+      return;
+    }
+    res.json({ decision, target, seed: opaqueToken(8), backgroundImage, parentOrigin: session.parent_origin });
   }));
 
   app.post("/v1/widget/sessions/:id/verify", asyncRoute(async (req, res) => {
@@ -223,6 +312,14 @@ export function createApp() {
     if (!session) return;
     if (session.state !== "pending" || !session.challenge_type) {
       res.status(409).json({ error: "CHALLENGE_NOT_READY" });
+      return;
+    }
+    const reserved = await prisma.widgetSession.updateMany({
+      where: { id: session.id, state: "pending", challenge_attempts: { lt: MAX_CHALLENGE_ATTEMPTS } },
+      data: { challenge_attempts: { increment: 1 } },
+    });
+    if (reserved.count !== 1) {
+      res.status(429).json({ error: "CHALLENGE_ATTEMPTS_EXHAUSTED" });
       return;
     }
     const input = verifyInput.parse(req.body);
@@ -240,23 +337,41 @@ export function createApp() {
       valid,
     }));
     if (!valid) {
-      await prisma.widgetSession.update({ where: { id: session.id }, data: { challenge_digest: summary } });
+      await prisma.widgetSession.updateMany({
+        where: { id: session.id, state: "pending" },
+        data: { challenge_digest: summary },
+      });
+      await prisma.widgetSession.updateMany({
+        where: { id: session.id, state: "pending", challenge_attempts: { gte: MAX_CHALLENGE_ATTEMPTS } },
+        data: { state: "failed" },
+      });
       res.status(400).json({ success: false, error: "CHALLENGE_REJECTED" });
       return;
     }
-    const completionToken = await completeSession(session.id);
-    await prisma.widgetSession.update({ where: { id: session.id }, data: { challenge_digest: summary } });
+    const completionToken = await completeSession(session.id, summary);
+    if (!completionToken) {
+      res.status(409).json({ error: "SESSION_ALREADY_COMPLETED" });
+      return;
+    }
     res.json({ success: true, completionToken, parentOrigin: session.parent_origin });
   }));
 
   app.post("/v1/widget/sessions/:id/accessibility-fallback", asyncRoute(async (req, res) => {
     const session = await requireWidgetSession(req, res);
     if (!session) return;
-    const challenge = textChallenge();
-    await prisma.widgetSession.update({
-      where: { id: session.id },
+    if (session.state !== "pending" || session.challenge_attempts >= MAX_CHALLENGE_ATTEMPTS) {
+      res.status(409).json({ error: "CHALLENGE_NOT_AVAILABLE" });
+      return;
+    }
+    const challenge = await textChallenge();
+    const updated = await prisma.widgetSession.updateMany({
+      where: { id: session.id, state: "pending" },
       data: { challenge_type: "text", challenge_answer_digest: challenge.answerDigest, slider_target: null },
     });
+    if (updated.count !== 1) {
+      res.status(409).json({ error: "CHALLENGE_NOT_AVAILABLE" });
+      return;
+    }
     res.json({ decision: "text", imageData: challenge.imageData, parentOrigin: session.parent_origin });
   }));
 
@@ -311,36 +426,65 @@ export function createApp() {
     await prisma.securityEvent.create({ data: { action: "site.create", site_id: site.id, metadata: JSON.stringify({ actor: req.admin!.username }) } });
     res.status(201).json({ site: { id: site.id, name: site.name, allowedOrigins: input.allowedOrigins, active: site.active }, secret });
   }));
-  app.put("/admin-api/sites/:id", requireAdmin, asyncRoute(async (req, res) => {
+  app.put("/admin-api/sites/:id", requireAdmin, asyncRoute(async (req: AdminRequest, res) => {
     const input = z.object({ name: z.string().trim().min(1).max(100).optional(), allowedOrigins: z.array(originSchema).min(1).max(20).optional(), active: z.boolean().optional() }).parse(req.body);
     const id = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
     const site = await prisma.site.update({
       where: { id },
       data: { name: input.name, allowed_origins: input.allowedOrigins ? JSON.stringify(input.allowedOrigins) : undefined, active: input.active },
     });
+    await prisma.securityEvent.create({
+      data: { action: "site.update", site_id: site.id, metadata: JSON.stringify({ actor: req.admin!.username }) },
+    });
     res.json({ id: site.id, name: site.name, allowedOrigins: JSON.parse(site.allowed_origins), active: site.active });
   }));
-  app.post("/admin-api/sites/:id/rotate-secret", requireAdmin, asyncRoute(async (req, res) => {
+  app.post("/admin-api/sites/:id/rotate-secret", requireAdmin, asyncRoute(async (req: AdminRequest, res) => {
     const id = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
     const secret = opaqueToken(48);
     await prisma.site.update({ where: { id }, data: { encrypted_secret: encryptSecret(secret) } });
+    await prisma.securityEvent.create({
+      data: { action: "site.secret_rotate", site_id: id, metadata: JSON.stringify({ actor: req.admin!.username }) },
+    });
     res.json({ secret });
   }));
   app.get("/admin-api/status", requireAdmin, asyncRoute(async (_req, res) => {
-    const [sites, sessions, completed, events] = await Promise.all([
+    const [sites, sessions, completed, events, redisHealthy] = await Promise.all([
       prisma.site.count(),
       prisma.widgetSession.count({ where: { created_at: { gte: new Date(Date.now() - 24 * 60 * 60 * 1000) } } }),
       prisma.widgetSession.count({ where: { completed_at: { gte: new Date(Date.now() - 24 * 60 * 60 * 1000) } } }),
       prisma.securityEvent.findMany({ take: 20, orderBy: { created_at: "desc" } }),
+      pingNonceStore().catch(() => false),
     ]);
-    res.json({ status: "healthy", sites, sessions24h: sessions, completed24h: completed, recentEvents: events });
+    res.json({ status: redisHealthy ? "healthy" : "degraded", database: "healthy", redis: redisHealthy ? "healthy" : "unavailable", sites, sessions24h: sessions, completed24h: completed, recentEvents: events });
   }));
   app.get("/admin-api/assets", requireAdmin, asyncRoute(async (_req, res) => {
     res.json(await prisma.challengeAsset.findMany({ orderBy: { created_at: "desc" } }));
   }));
-  app.post("/admin-api/assets", requireAdmin, asyncRoute(async (req, res) => {
-    const input = z.object({ kind: z.enum(["text_wordlist", "slider_background"]), label: z.string().min(1).max(100), payload: z.string().min(1).max(100_000) }).parse(req.body);
-    res.status(201).json(await prisma.challengeAsset.create({ data: input }));
+  app.post("/admin-api/assets", requireAdmin, asyncRoute(async (req: AdminRequest, res) => {
+    const input = assetCreateInput.parse(req.body);
+    const asset = await prisma.challengeAsset.create({ data: input });
+    await prisma.securityEvent.create({
+      data: { action: "asset.create", metadata: JSON.stringify({ actor: req.admin!.username, assetId: asset.id, kind: asset.kind }) },
+    });
+    res.status(201).json(asset);
+  }));
+  app.put("/admin-api/assets/:id", requireAdmin, asyncRoute(async (req: AdminRequest, res) => {
+    const input = assetUpdateInput.parse(req.body);
+    const id = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+    const current = await prisma.challengeAsset.findUnique({ where: { id } });
+    if (!current) {
+      res.status(404).json({ error: "NOT_FOUND" });
+      return;
+    }
+    if (input.payload && !validAssetPayload(current.kind, input.payload)) {
+      res.status(400).json({ error: "VALIDATION_ERROR" });
+      return;
+    }
+    const asset = await prisma.challengeAsset.update({ where: { id }, data: input });
+    await prisma.securityEvent.create({
+      data: { action: "asset.update", metadata: JSON.stringify({ actor: req.admin!.username, assetId: asset.id, active: asset.active }) },
+    });
+    res.json(asset);
   }));
 
   app.get("/embed/v1/widget", asyncRoute(async (req, res) => {

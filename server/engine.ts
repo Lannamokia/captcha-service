@@ -55,7 +55,9 @@ export function analyzeTrajectory(points: TrajectoryPoint[], target: number): bo
   return variance > 0.00001 && ySpread >= 1;
 }
 
-export function randomTextAnswer(): string {
+export function randomTextAnswer(candidates: string[] = []): string {
+  const validCandidates = candidates.filter((value) => /^\d{6}$/.test(value));
+  if (validCandidates.length) return validCandidates[crypto.randomInt(0, validCandidates.length)];
   return Array.from({ length: 6 }, () => crypto.randomInt(0, 10).toString()).join("");
 }
 

@@ -14,7 +14,7 @@ type Bootstrap = {
 
 type Challenge =
   | { decision: "text"; imageData: string; parentOrigin: string }
-  | { decision: "slider"; target: number; seed: string; parentOrigin: string };
+  | { decision: "slider"; target: number; seed: string; backgroundImage?: string; parentOrigin: string };
 
 type MessageEventName = "captcha.ready" | "captcha.resize" | "captcha.completed" | "captcha.expired" | "captcha.error";
 
@@ -178,7 +178,10 @@ export function CaptchaWidget() {
       {phase === "slider" && challenge?.decision === "slider" && (
         <section className="challenge-block">
           <div className="challenge-label"><SlidersHorizontal size={15} /> 滑块验证</div>
-          <div className="slider-scene" style={{ "--target": `${challenge.target}px` } as CSSProperties}>
+          <div className="slider-scene" style={{
+            "--target-position": `${(challenge.target / 260) * 100}%`,
+            ...(challenge.backgroundImage ? { backgroundImage: `url(${challenge.backgroundImage})` } : {}),
+          } as CSSProperties}>
             <span className="slider-target" />
           </div>
           <input
@@ -194,6 +197,9 @@ export function CaptchaWidget() {
             }}
             onPointerMove={(event) => {
               if (!event.buttons) return;
+              pointsRef.current.push({ x: Number(event.currentTarget.value), y: event.clientY, t: performance.now() - startRef.current });
+            }}
+            onPointerUp={(event) => {
               pointsRef.current.push({ x: Number(event.currentTarget.value), y: event.clientY, t: performance.now() - startRef.current });
             }}
             onChange={(event) => setAnswer(Number(event.target.value))}

@@ -46,6 +46,7 @@ model WidgetSession {
   challenge_answer_digest  String?
   slider_target            Int?
   challenge_digest         String?
+  challenge_attempts       Int      @default(0)
   completion_digest        String?  @unique
   state                    String   @default("pending")
   expires_at               DateTime

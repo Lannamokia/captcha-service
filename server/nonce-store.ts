@@ -48,6 +48,11 @@ export async function clearNonceStore(): Promise<void> {
   }
 }
 
+export async function pingNonceStore(): Promise<boolean> {
+  if (config.REDIS_URL.startsWith("memory://")) return true;
+  return (await (await client()).ping()) === "PONG";
+}
+
 export async function disconnectNonceStore(): Promise<void> {
   memoryNonces.clear();
   connectPromise = null;

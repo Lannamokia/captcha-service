@@ -15,7 +15,8 @@ import {
   analyzeTrajectory,
   randomSliderTarget,
   randomTextAnswer,
-  scoreEnvironment,
+  isTextChallenge,
+  scoreEnvironmentDetails,
   selectChallenge,
   type EnvironmentSignals,
   type TrajectoryPoint,
@@ -28,6 +29,7 @@ const webRoot = path.resolve(__dirname, "../web");
 const SESSION_TTL_MS = 5 * 60 * 1000;
 const MAX_CHALLENGE_ATTEMPTS = 5;
 const originSchema = z.string().url().refine((value) => new URL(value).origin === value, "Expected an origin without path, query or fragment");
+const adminOrigin = new URL(config.PUBLIC_BASE_URL).origin;
 
 const sessionInput = z.object({
   usernameDigest: z.string().min(20).max(256),
@@ -38,6 +40,10 @@ const sessionInput = z.object({
   credentialFailure: z.boolean(),
   theme: z.enum(["light", "dark"]).optional().default("light"),
   brandColor: z.string().regex(/^#[0-9a-fA-F]{6}$/).optional().default("#2563eb"),
+});
+
+const testSessionInput = sessionInput.extend({
+  challengeType: z.enum(["text", "slider"]),
 });
 
 const evaluateInput = z.object({
@@ -63,9 +69,9 @@ const assetCreateInput = z.discriminatedUnion("kind", [
     payload: z.string().min(1).max(100_000).refine(
       (value) => {
         const entries = value.split(/\r?\n/).map((item) => item.trim()).filter(Boolean);
-        return entries.length > 0 && entries.every((item) => /^\d{6}$/.test(item));
+        return entries.length > 0 && entries.every((item) => isTextChallenge(item));
       },
-      "Text wordlists must contain one six-digit challenge per line",
+      "Text wordlists must contain one six-character uppercase alphanumeric challenge per line, with at least one letter and one digit",
     ),
   }),
   z.object({
@@ -110,7 +116,7 @@ async function requireWidgetSession(req: Request, res: Response) {
   return session;
 }
 
-async function completeSession(id: string, challengeSummary?: string): Promise<string | null> {
+async function completeSession(id: string, challengeSummary?: string, riskScore?: number): Promise<string | null> {
   const completionToken = opaqueToken();
   const completed = await prisma.widgetSession.updateMany({
     where: { id, state: "pending" },
@@ -119,6 +125,7 @@ async function completeSession(id: string, challengeSummary?: string): Promise<s
       completion_digest: digest(completionToken),
       completed_at: new Date(),
       challenge_digest: challengeSummary,
+      risk_score: riskScore,
     },
   });
   return completed.count === 1 ? completionToken : null;
@@ -148,7 +155,7 @@ async function sliderBackground(): Promise<string | undefined> {
 function validAssetPayload(kind: string, payload: string): boolean {
   if (kind === "text_wordlist") {
     const entries = payload.split(/\r?\n/).map((item) => item.trim()).filter(Boolean);
-    return entries.length > 0 && entries.every((item) => /^\d{6}$/.test(item));
+    return entries.length > 0 && entries.every((item) => isTextChallenge(item));
   }
   if (kind === "slider_background") {
     return /^data:image\/(?:png|jpeg|webp);base64,[A-Za-z0-9+/=]+$/.test(payload);
@@ -156,8 +163,42 @@ function validAssetPayload(kind: string, payload: string): boolean {
   return false;
 }
 
+function configuredOrigins(value: string): string[] {
+  return JSON.parse(value) as string[];
+}
+
+function effectiveOrigins(value: string): string[] {
+  return [...new Set([...configuredOrigins(value), adminOrigin])];
+}
+
+function serializeSite(site: { id: string; name: string; allowed_origins: string; active: boolean; created_at?: Date; updated_at?: Date }) {
+  const allowedOrigins = configuredOrigins(site.allowed_origins);
+  return {
+    id: site.id,
+    name: site.name,
+    allowedOrigins,
+    adminOrigin,
+    effectiveAllowedOrigins: effectiveOrigins(site.allowed_origins),
+    active: site.active,
+    createdAt: site.created_at,
+    updatedAt: site.updated_at,
+  };
+}
+
 function frameAncestors(origin: string) {
   return `frame-ancestors 'self' ${origin}`;
+}
+
+function sessionCreationResponse(session: { id: string; expires_at: Date }, token: string) {
+  const iframeUrl = new URL("/embed/v1/widget", config.PUBLIC_BASE_URL);
+  iframeUrl.searchParams.set("session", session.id);
+  iframeUrl.hash = new URLSearchParams({ token }).toString();
+  return {
+    iframeUrl: iframeUrl.toString(),
+    allowedOrigin: adminOrigin,
+    sessionRef: session.id,
+    expiresAt: session.expires_at,
+  };
 }
 
 export function createApp() {
@@ -183,7 +224,7 @@ export function createApp() {
   app.post("/v1/sites/:siteId/sessions", requireSiteSignature, asyncRoute(async (req: RawRequest, res) => {
     const input = sessionInput.parse(req.body);
     const site = req.captchaSite!;
-    const allowedOrigins = JSON.parse(site.allowed_origins) as string[];
+    const allowedOrigins = effectiveOrigins(site.allowed_origins);
     if (!allowedOrigins.includes(input.parentOrigin)) {
       res.status(403).json({ error: "ORIGIN_NOT_ALLOWED" });
       return;
@@ -204,15 +245,33 @@ export function createApp() {
         expires_at: new Date(Date.now() + SESSION_TTL_MS),
       },
     });
-    const iframeUrl = new URL("/embed/v1/widget", config.PUBLIC_BASE_URL);
-    iframeUrl.searchParams.set("session", session.id);
-    iframeUrl.hash = new URLSearchParams({ token }).toString();
-    res.status(201).json({
-      iframeUrl: iframeUrl.toString(),
-      allowedOrigin: new URL(config.PUBLIC_BASE_URL).origin,
-      sessionRef: session.id,
-      expiresAt: session.expires_at,
+    res.status(201).json(sessionCreationResponse(session, token));
+  }));
+
+  app.post("/admin-api/test/sites/:siteId/sessions", requireAdmin, requireSiteSignature, asyncRoute(async (req: RawRequest, res) => {
+    const input = testSessionInput.parse(req.body);
+    if (input.parentOrigin !== adminOrigin) {
+      res.status(403).json({ error: "ADMIN_ORIGIN_REQUIRED" });
+      return;
+    }
+    const token = opaqueToken();
+    const session = await prisma.widgetSession.create({
+      data: {
+        site_id: req.captchaSite!.id,
+        token_digest: digest(token),
+        parent_origin: input.parentOrigin,
+        action: input.action,
+        username_digest: input.usernameDigest,
+        policy_version: input.policyVersion,
+        level: input.level,
+        credential_failure: input.credentialFailure,
+        theme: input.theme,
+        brand_color: input.brandColor,
+        test_challenge_type: input.challengeType,
+        expires_at: new Date(Date.now() + SESSION_TTL_MS),
+      },
     });
+    res.status(201).json(sessionCreationResponse(session, token));
   }));
 
   app.post("/v1/verifications/redeem", requireSiteSignature, asyncRoute(async (req: RawRequest, res) => {
@@ -270,15 +329,19 @@ export function createApp() {
       return;
     }
     const signals = evaluateInput.parse(req.body) as EnvironmentSignals;
-    const riskScore = scoreEnvironment(signals);
-    const decision = selectChallenge(session.level, riskScore, session.credential_failure);
+    const scoreDetails = scoreEnvironmentDetails(signals);
+    const riskScore = scoreDetails.score;
+    const decision = session.test_challenge_type === "text" || session.test_challenge_type === "slider"
+      ? session.test_challenge_type
+      : selectChallenge(session.level, riskScore, session.credential_failure);
+    const diagnostic = session.test_challenge_type ? { diagnostic: scoreDetails } : {};
     if (decision === "pass") {
-      const completionToken = await completeSession(session.id);
+      const completionToken = await completeSession(session.id, undefined, riskScore);
       if (!completionToken) {
         res.status(409).json({ error: "SESSION_ALREADY_COMPLETED" });
         return;
       }
-      res.json({ decision, completionToken, parentOrigin: session.parent_origin });
+      res.json({ decision, completionToken, parentOrigin: session.parent_origin, ...diagnostic });
       return;
     }
     if (decision === "text") {
@@ -291,7 +354,7 @@ export function createApp() {
         res.status(409).json({ error: "CHALLENGE_NOT_AVAILABLE" });
         return;
       }
-      res.json({ decision, imageData: challenge.imageData, parentOrigin: session.parent_origin });
+      res.json({ decision, imageData: challenge.imageData, parentOrigin: session.parent_origin, ...diagnostic });
       return;
     }
     const target = randomSliderTarget();
@@ -304,7 +367,7 @@ export function createApp() {
       res.status(409).json({ error: "CHALLENGE_NOT_AVAILABLE" });
       return;
     }
-    res.json({ decision, target, seed: opaqueToken(8), backgroundImage, parentOrigin: session.parent_origin });
+    res.json({ decision, target, seed: opaqueToken(8), backgroundImage, parentOrigin: session.parent_origin, ...diagnostic });
   }));
 
   app.post("/v1/widget/sessions/:id/verify", asyncRoute(async (req, res) => {
@@ -325,7 +388,7 @@ export function createApp() {
     const input = verifyInput.parse(req.body);
     let valid = false;
     if (session.challenge_type === "text" && session.challenge_answer_digest) {
-      valid = safeEqual(challengeDigest(String(input.answer)), session.challenge_answer_digest);
+      valid = safeEqual(challengeDigest(String(input.answer).trim().toUpperCase()), session.challenge_answer_digest);
     } else if (session.challenge_type === "slider" && session.slider_target !== null && input.trajectory) {
       valid = Number(input.answer) === Math.round(input.trajectory.at(-1)?.x || -1) &&
         analyzeTrajectory(input.trajectory as TrajectoryPoint[], session.slider_target);
@@ -405,14 +468,7 @@ export function createApp() {
 
   app.get("/admin-api/sites", requireAdmin, asyncRoute(async (_req, res) => {
     const sites = await prisma.site.findMany({ orderBy: { created_at: "desc" } });
-    res.json(sites.map((site) => ({
-      id: site.id,
-      name: site.name,
-      allowedOrigins: JSON.parse(site.allowed_origins),
-      active: site.active,
-      createdAt: site.created_at,
-      updatedAt: site.updated_at,
-    })));
+    res.json(sites.map(serializeSite));
   }));
   app.post("/admin-api/sites", requireAdmin, asyncRoute(async (req: AdminRequest, res) => {
     const input = z.object({
@@ -424,7 +480,7 @@ export function createApp() {
       data: { name: input.name, allowed_origins: JSON.stringify(input.allowedOrigins), encrypted_secret: encryptSecret(secret) },
     });
     await prisma.securityEvent.create({ data: { action: "site.create", site_id: site.id, metadata: JSON.stringify({ actor: req.admin!.username }) } });
-    res.status(201).json({ site: { id: site.id, name: site.name, allowedOrigins: input.allowedOrigins, active: site.active }, secret });
+    res.status(201).json({ site: serializeSite(site), secret });
   }));
   app.put("/admin-api/sites/:id", requireAdmin, asyncRoute(async (req: AdminRequest, res) => {
     const input = z.object({ name: z.string().trim().min(1).max(100).optional(), allowedOrigins: z.array(originSchema).min(1).max(20).optional(), active: z.boolean().optional() }).parse(req.body);
@@ -436,7 +492,7 @@ export function createApp() {
     await prisma.securityEvent.create({
       data: { action: "site.update", site_id: site.id, metadata: JSON.stringify({ actor: req.admin!.username }) },
     });
-    res.json({ id: site.id, name: site.name, allowedOrigins: JSON.parse(site.allowed_origins), active: site.active });
+    res.json(serializeSite(site));
   }));
   app.post("/admin-api/sites/:id/rotate-secret", requireAdmin, asyncRoute(async (req: AdminRequest, res) => {
     const id = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;

@@ -42,6 +42,7 @@ model WidgetSession {
   theme                    String   @default("light")
   brand_color              String   @default("#2563eb")
   risk_score               Int?
+  test_challenge_type      String?
   challenge_type           String?
   challenge_answer_digest  String?
   slider_target            Int?

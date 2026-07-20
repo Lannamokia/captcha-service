@@ -1,5 +1,9 @@
 import crypto from "node:crypto";
 
+const TEXT_LETTERS = "ABCDEFGHJKLMNPQRSTUVWXYZ";
+const TEXT_DIGITS = "23456789";
+const TEXT_ALPHABET = `${TEXT_LETTERS}${TEXT_DIGITS}`;
+
 export interface EnvironmentSignals {
   wasmAvailable: boolean;
   webdriver: boolean;
@@ -11,19 +15,38 @@ export interface EnvironmentSignals {
   elapsedMs: number;
 }
 
+export interface ScoreDeduction {
+  factor: "wasm_unavailable" | "webdriver" | "plugins_empty" | "languages_empty" |
+    "hardware_concurrency_missing" | "touch_points_invalid" | "visibility_changes_high" | "elapsed_too_fast";
+  points: number;
+}
+
+export interface EnvironmentScore {
+  score: number;
+  deductions: ScoreDeduction[];
+}
+
 export interface TrajectoryPoint { x: number; y: number; t: number }
 
+export function scoreEnvironmentDetails(signals: EnvironmentSignals): EnvironmentScore {
+  const deductions: ScoreDeduction[] = [];
+  const deduct = (triggered: boolean, factor: ScoreDeduction["factor"], points: number) => {
+    if (triggered) deductions.push({ factor, points });
+  };
+  deduct(!signals.wasmAvailable, "wasm_unavailable", 25);
+  deduct(signals.webdriver, "webdriver", 55);
+  deduct(signals.plugins === 0, "plugins_empty", 8);
+  deduct(signals.languages === 0, "languages_empty", 12);
+  deduct(signals.hardwareConcurrency <= 0, "hardware_concurrency_missing", 8);
+  deduct(signals.touchPoints < 0, "touch_points_invalid", 5);
+  deduct(signals.visibilityChanges > 5, "visibility_changes_high", 8);
+  deduct(signals.elapsedMs < 150, "elapsed_too_fast", 20);
+  const total = deductions.reduce((sum, item) => sum + item.points, 0);
+  return { score: Math.max(0, Math.min(100, 100 - total)), deductions };
+}
+
 export function scoreEnvironment(signals: EnvironmentSignals): number {
-  let score = 100;
-  if (!signals.wasmAvailable) score -= 25;
-  if (signals.webdriver) score -= 55;
-  if (signals.plugins === 0) score -= 8;
-  if (signals.languages === 0) score -= 12;
-  if (signals.hardwareConcurrency <= 0) score -= 8;
-  if (signals.touchPoints < 0) score -= 5;
-  if (signals.visibilityChanges > 5) score -= 8;
-  if (signals.elapsedMs < 150) score -= 20;
-  return Math.max(0, Math.min(100, score));
+  return scoreEnvironmentDetails(signals).score;
 }
 
 export type ChallengeDecision = "pass" | "text" | "slider";
@@ -55,10 +78,23 @@ export function analyzeTrajectory(points: TrajectoryPoint[], target: number): bo
   return variance > 0.00001 && ySpread >= 1;
 }
 
+export function isTextChallenge(value: string): boolean {
+  return /^(?=.*[A-Z])(?=.*\d)[A-Z0-9]{6}$/.test(value);
+}
+
 export function randomTextAnswer(candidates: string[] = []): string {
-  const validCandidates = candidates.filter((value) => /^\d{6}$/.test(value));
+  const validCandidates = candidates.map((value) => value.trim().toUpperCase()).filter(isTextChallenge);
   if (validCandidates.length) return validCandidates[crypto.randomInt(0, validCandidates.length)];
-  return Array.from({ length: 6 }, () => crypto.randomInt(0, 10).toString()).join("");
+  const characters = [
+    TEXT_LETTERS[crypto.randomInt(0, TEXT_LETTERS.length)],
+    TEXT_DIGITS[crypto.randomInt(0, TEXT_DIGITS.length)],
+    ...Array.from({ length: 4 }, () => TEXT_ALPHABET[crypto.randomInt(0, TEXT_ALPHABET.length)]),
+  ];
+  for (let index = characters.length - 1; index > 0; index -= 1) {
+    const target = crypto.randomInt(0, index + 1);
+    [characters[index], characters[target]] = [characters[target], characters[index]];
+  }
+  return characters.join("");
 }
 
 export function randomSliderTarget(): number {

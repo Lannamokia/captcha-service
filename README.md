@@ -16,11 +16,13 @@ npm start
 
 Open `http://localhost:4100/admin` to initialize the first administrator. Create a site and record the returned site secret; it is shown once.
 
-The admin console also manages challenge assets:
+The admin console also manages challenge assets and integration credentials:
 
-- Text wordlists contain one six-digit value per line. Only active wordlists participate in challenge generation.
+- Text wordlists contain one six-character uppercase alphanumeric value per line, with at least one letter and one digit. The asset editor can securely generate 100 unique entries in one click. Only active wordlists participate in challenge generation.
 - Slider backgrounds are PNG, JPEG, or WebP images uploaded as data URLs. Only active backgrounds are selected.
 - Disabling an asset removes it from new challenges without changing existing sessions. Site, secret, and asset changes create redacted security events.
+- Secret rotation requires an explicit acknowledgement in the console because the old secret becomes invalid immediately.
+- The credential test view signs the real HMAC session and redemption requests, runs either text recognition or slider interaction in the real widget, and reports the server-calculated browser trust score and deductions.
 
 ## Integration protocol
 
@@ -38,7 +40,9 @@ The canonical signature input is:
 METHOD\nPATH\nTIMESTAMP\nNONCE\nBODY_DIGEST
 ```
 
-The session secret is placed in the iframe URL fragment. Only the non-secret session ID appears in the query string. Widget messages use protocol version `1` and one of `captcha.ready`, `captcha.resize`, `captcha.completed`, `captcha.expired`, or `captcha.error`.
+The session secret is placed in the iframe URL fragment. Only the non-secret session ID appears in the query string. Widget messages use protocol version `1` and one of `captcha.ready`, `captcha.resize`, `captcha.evaluated` (admin test sessions only), `captcha.completed`, `captcha.expired`, or `captcha.error`.
+
+Every site implicitly trusts the origin of `PUBLIC_BASE_URL` so the management console can embed the widget in its credential test view. This management origin is returned separately as `adminOrigin`; `allowedOrigins` remains the operator-configured list, while `effectiveAllowedOrigins` is their de-duplicated union.
 
 ## Production
 

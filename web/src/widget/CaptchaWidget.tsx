@@ -12,11 +12,17 @@ type Bootstrap = {
   protocolVersion: 1;
 };
 
-type Challenge =
-  | { decision: "text"; imageData: string; parentOrigin: string }
-  | { decision: "slider"; target: number; seed: string; backgroundImage?: string; parentOrigin: string };
+type Diagnostic = {
+  score: number;
+  deductions: Array<{ factor: string; points: number }>;
+};
 
-type MessageEventName = "captcha.ready" | "captcha.resize" | "captcha.completed" | "captcha.expired" | "captcha.error";
+type Challenge = (
+  | { decision: "text"; imageData: string; parentOrigin: string }
+  | { decision: "slider"; target: number; seed: string; backgroundImage?: string; parentOrigin: string }
+) & { diagnostic?: Diagnostic };
+
+type MessageEventName = "captcha.ready" | "captcha.resize" | "captcha.evaluated" | "captcha.completed" | "captcha.expired" | "captcha.error";
 
 export function CaptchaWidget() {
   const params = useMemo(() => new URLSearchParams(window.location.search), []);
@@ -88,7 +94,7 @@ export function CaptchaWidget() {
     setError("");
     const started = performance.now();
     try {
-      const result = await api<Challenge | { decision: "pass"; completionToken: string; parentOrigin: string }>(
+      const result = await api<Challenge | ({ decision: "pass"; completionToken: string; parentOrigin: string } & { diagnostic?: Diagnostic })>(
         `/v1/widget/sessions/${sessionId}/evaluate`,
         {
           method: "POST",
@@ -105,6 +111,13 @@ export function CaptchaWidget() {
         },
         tokenRef.current
       );
+      if (result.diagnostic) {
+        post("captcha.evaluated", {
+          score: result.diagnostic.score,
+          deductions: result.diagnostic.deductions,
+          challengeType: result.decision,
+        });
+      }
       if (result.decision === "pass") {
         setPhase("complete");
         post("captcha.completed", { token: result.completionToken });
@@ -169,7 +182,7 @@ export function CaptchaWidget() {
           <div className="challenge-label"><Type size={15} /> 图形验证码</div>
           <img className="captcha-image" src={challenge.imageData} alt="验证码图像" />
           <div className="inline-control">
-            <input value={textAnswer} inputMode="numeric" maxLength={6} aria-label="验证码" onChange={(event) => setTextAnswer(event.target.value.replace(/\D/g, ""))} />
+            <input value={textAnswer} autoCapitalize="characters" maxLength={6} aria-label="验证码" onChange={(event) => setTextAnswer(event.target.value.toUpperCase().replace(/[^A-Z0-9]/g, ""))} />
             <button className="icon-button" title="刷新" aria-label="刷新" onClick={() => void evaluate()}><RefreshCw size={17} /></button>
           </div>
           <button className="primary-button" disabled={textAnswer.length !== 6} onClick={() => void submit()}>提交验证</button>

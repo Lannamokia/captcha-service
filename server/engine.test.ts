@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { analyzeTrajectory, scoreEnvironment, selectChallenge } from "./engine.js";
+import { analyzeTrajectory, isTextChallenge, randomTextAnswer, scoreEnvironment, scoreEnvironmentDetails, selectChallenge } from "./engine.js";
 
 describe("captcha risk policy", () => {
   it("uses the documented low, medium and high thresholds", () => {
@@ -17,7 +17,7 @@ describe("captcha risk policy", () => {
   });
 
   it("penalizes automation and a missing WASM environment", () => {
-    const score = scoreEnvironment({
+    const signals = {
       wasmAvailable: false,
       webdriver: true,
       plugins: 0,
@@ -26,8 +26,16 @@ describe("captcha risk policy", () => {
       touchPoints: 0,
       visibilityChanges: 10,
       elapsedMs: 20,
-    });
+    };
+    const score = scoreEnvironment(signals);
     expect(score).toBeLessThan(20);
+    expect(scoreEnvironmentDetails(signals)).toMatchObject({
+      score,
+      deductions: expect.arrayContaining([
+        { factor: "webdriver", points: 55 },
+        { factor: "wasm_unavailable", points: 25 },
+      ]),
+    });
   });
 });
 
@@ -43,5 +51,17 @@ describe("slider trajectory analysis", () => {
   it("rejects instant and perfectly synthetic movement", () => {
     const points = Array.from({ length: 10 }, (_, index) => ({ x: index * 10, y: 10, t: index * 10 }));
     expect(analyzeTrajectory(points, 90)).toBe(false);
+  });
+});
+
+describe("text challenge generation", () => {
+  it("generates six-character challenges containing letters and digits", () => {
+    for (let index = 0; index < 100; index += 1) {
+      expect(isTextChallenge(randomTextAnswer())).toBe(true);
+    }
+  });
+
+  it("uses only valid mixed candidates from an active wordlist", () => {
+    expect(randomTextAnswer(["123456", "ABCDEF", "A2B3C4"])).toBe("A2B3C4");
   });
 });

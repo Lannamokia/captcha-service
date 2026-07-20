@@ -2,6 +2,7 @@ import crypto from "node:crypto";
 import request from "supertest";
 import { afterAll, beforeEach, describe, expect, it } from "vitest";
 import { createApp } from "./app.js";
+import { config } from "./config.js";
 import { prisma } from "./database.js";
 import { digest } from "./crypto.js";
 import { signRequest } from "./hmac.js";
@@ -105,6 +106,12 @@ describe("captcha service HTTP protocol", () => {
       .set("authorization", `Bearer ${adminToken}`)
       .send({ name: "Main login", allowedOrigins: ["https://login.example.com"] });
     expect(siteResponse.status).toBe(201);
+    const managementOrigin = new URL(config.PUBLIC_BASE_URL).origin;
+    expect(siteResponse.body.site).toMatchObject({
+      allowedOrigins: ["https://login.example.com"],
+      adminOrigin: managementOrigin,
+      effectiveAllowedOrigins: ["https://login.example.com", managementOrigin],
+    });
     const siteId = siteResponse.body.site.id as string;
     const secret = siteResponse.body.secret as string;
 
@@ -155,6 +162,13 @@ describe("captcha service HTTP protocol", () => {
     expect(rejected.status).toBe(403);
     expect(rejected.body.error).toBe("ORIGIN_NOT_ALLOWED");
 
+    const adminOriginBody = JSON.stringify({ ...JSON.parse(body), parentOrigin: managementOrigin });
+    const adminOriginSession = await request(app).post(path)
+      .set(signatureHeaders(siteId, secret, "POST", path, adminOriginBody))
+      .set("content-type", "application/json")
+      .send(adminOriginBody);
+    expect(adminOriginSession.status).toBe(201);
+
     const iframeUrl = new URL(sessionResponse.body.iframeUrl);
     const sessionId = iframeUrl.searchParams.get("session")!;
     const widgetToken = new URLSearchParams(iframeUrl.hash.slice(1)).get("token")!;
@@ -193,10 +207,20 @@ describe("captcha service HTTP protocol", () => {
 
   it("uses an active text asset, limits challenge attempts, and redeems concurrently only once", async () => {
     const { adminToken, siteId, secret } = await setupSite();
+    const digitsOnly = await request(app)
+      .post("/admin-api/assets")
+      .set("authorization", `Bearer ${adminToken}`)
+      .send({ kind: "text_wordlist", label: "Digits only", payload: "123456" });
+    expect(digitsOnly.status).toBe(400);
+    const lettersOnly = await request(app)
+      .post("/admin-api/assets")
+      .set("authorization", `Bearer ${adminToken}`)
+      .send({ kind: "text_wordlist", label: "Letters only", payload: "ABCDEF" });
+    expect(lettersOnly.status).toBe(400);
     const asset = await request(app)
       .post("/admin-api/assets")
       .set("authorization", `Bearer ${adminToken}`)
-      .send({ kind: "text_wordlist", label: "Login digits", payload: "123456" });
+      .send({ kind: "text_wordlist", label: "Login mixed", payload: "A2B3C4" });
     expect(asset.status).toBe(201);
 
     const { sessionId, widgetToken } = await createSession(siteId, secret, { level: "low", credentialFailure: true });
@@ -219,7 +243,7 @@ describe("captcha service HTTP protocol", () => {
     const verify = await request(app)
       .post(`/v1/widget/sessions/${sessionId}/verify`)
       .set("authorization", `Bearer ${widgetToken}`)
-      .send({ answer: "123456" });
+      .send({ answer: "a2b3c4" });
     expect(verify.status).toBe(200);
 
     const redeemPath = "/v1/verifications/redeem";
@@ -278,7 +302,7 @@ describe("captcha service HTTP protocol", () => {
     await request(app)
       .post("/admin-api/assets")
       .set("authorization", `Bearer ${adminToken}`)
-      .send({ kind: "text_wordlist", label: "Accessible digits", payload: "654321" });
+      .send({ kind: "text_wordlist", label: "Accessible mixed", payload: "Z9Y8X7" });
     const { sessionId, widgetToken } = await createSession(siteId, secret, { level: "high", credentialFailure: false });
     const fallback = await request(app)
       .post(`/v1/widget/sessions/${sessionId}/accessibility-fallback`)
@@ -289,8 +313,82 @@ describe("captcha service HTTP protocol", () => {
     const verify = await request(app)
       .post(`/v1/widget/sessions/${sessionId}/verify`)
       .set("authorization", `Bearer ${widgetToken}`)
-      .send({ answer: "654321" });
+      .send({ answer: "z9y8x7" });
     expect(verify.status).toBe(200);
+  });
+
+  it("tests a site secret through complete text and slider flows with concrete browser scoring", async () => {
+    const { adminToken, siteId, secret } = await setupSite();
+    await request(app)
+      .post("/admin-api/assets")
+      .set("authorization", `Bearer ${adminToken}`)
+      .send({ kind: "text_wordlist", label: "Credential test", payload: "A2B3C4" });
+
+    const invalidPath = `/admin-api/test/sites/${siteId}/sessions`;
+    const invalidBody = JSON.stringify({
+      usernameDigest: "u".repeat(43),
+      action: "login",
+      parentOrigin: new URL(config.PUBLIC_BASE_URL).origin,
+      policyVersion: 1,
+      level: "high",
+      credentialFailure: false,
+      theme: "light",
+      brandColor: "#147d92",
+      challengeType: "text",
+    });
+    const invalidSecret = await request(app).post(invalidPath)
+      .set("authorization", `Bearer ${adminToken}`)
+      .set(signatureHeaders(siteId, "incorrect-secret-with-at-least-32-characters", "POST", invalidPath, invalidBody))
+      .set("content-type", "application/json")
+      .send(invalidBody);
+    expect(invalidSecret.status).toBe(401);
+    expect(invalidSecret.body.error).toBe("INVALID_SIGNATURE");
+
+    for (const challengeType of ["text", "slider"] as const) {
+      const path = `/admin-api/test/sites/${siteId}/sessions`;
+      const body = JSON.stringify({ ...JSON.parse(invalidBody), challengeType });
+      const created = await request(app).post(path)
+        .set("authorization", `Bearer ${adminToken}`)
+        .set(signatureHeaders(siteId, secret, "POST", path, body))
+        .set("content-type", "application/json")
+        .send(body);
+      expect(created.status).toBe(201);
+
+      const iframeUrl = new URL(created.body.iframeUrl);
+      const sessionId = iframeUrl.searchParams.get("session")!;
+      const widgetToken = new URLSearchParams(iframeUrl.hash.slice(1)).get("token")!;
+      const evaluate = await request(app)
+        .post(`/v1/widget/sessions/${sessionId}/evaluate`)
+        .set("authorization", `Bearer ${widgetToken}`)
+        .send({ wasmAvailable: true, webdriver: false, plugins: 3, languages: 2, hardwareConcurrency: 8, touchPoints: 0, visibilityChanges: 0, elapsedMs: 500 });
+      expect(evaluate.status).toBe(200);
+      expect(evaluate.body.decision).toBe(challengeType);
+      expect(evaluate.body.diagnostic).toEqual({ score: 100, deductions: [] });
+
+      let verifyBody: { answer: string | number; trajectory?: Array<{ x: number; y: number; t: number }> } = { answer: "a2b3c4" };
+      if (challengeType === "slider") {
+        const target = evaluate.body.target as number;
+        const fractions = [0, 0.04, 0.12, 0.25, 0.42, 0.61, 0.78, 0.9, 0.97, 1];
+        verifyBody = {
+          answer: target,
+          trajectory: fractions.map((fraction, index) => ({ x: Math.round(target * fraction), y: 10 + (index % 3), t: index * 100 })),
+        };
+      }
+      const verify = await request(app)
+        .post(`/v1/widget/sessions/${sessionId}/verify`)
+        .set("authorization", `Bearer ${widgetToken}`)
+        .send(verifyBody);
+      expect(verify.status).toBe(200);
+
+      const redeemPath = "/v1/verifications/redeem";
+      const redeemBody = JSON.stringify({ sessionRef: sessionId, token: verify.body.completionToken });
+      const redeem = await request(app).post(redeemPath)
+        .set(signatureHeaders(siteId, secret, "POST", redeemPath, redeemBody))
+        .set("content-type", "application/json")
+        .send(redeemBody);
+      expect(redeem.status).toBe(200);
+      expect(redeem.body.success).toBe(true);
+    }
   });
 
   it("locks a challenge session after five rejected answers", async () => {

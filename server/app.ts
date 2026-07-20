@@ -146,7 +146,7 @@ async function textChallenge() {
   const answer = randomTextAnswer(candidates);
   return {
     answerDigest: challengeDigest(answer),
-    imageData: `data:image/png;base64,${renderCaptchaPng(answer).toString("base64")}`,
+    imageData: `data:image/png;base64,${(await renderCaptchaPng(answer)).toString("base64")}`,
   };
 }
 

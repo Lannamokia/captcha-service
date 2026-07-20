@@ -4,11 +4,14 @@ import { afterAll, beforeEach, describe, expect, it } from "vitest";
 import { createApp } from "./app.js";
 import { config } from "./config.js";
 import { prisma } from "./database.js";
-import { digest } from "./crypto.js";
+import { digest, scopeMachineFingerprint } from "./crypto.js";
+import { scoreEnvironmentDetails, type EnvironmentSignals, type ScoreDeduction } from "./engine.js";
 import { signRequest } from "./hmac.js";
+import { expectedIntegrityResponse, type IntegrityChallenge } from "./integrity-challenge.js";
 import { clearNonceStore, disconnectNonceStore } from "./nonce-store.js";
 
 const app = createApp();
+const TEST_FINGERPRINT = crypto.createHash("sha256").update("integration-test-browser").digest("hex");
 
 function signatureHeaders(
   siteId: string,
@@ -35,6 +38,58 @@ function rawPositionForTarget(motionMap: number[], target: number): number {
     if (Math.abs(motionMap[index] - target) < Math.abs(motionMap[closest] - target)) closest = index;
   }
   return closest;
+}
+
+const scoreBits: Partial<Record<ScoreDeduction["factor"], number>> = {
+  wasm_unavailable: 1 << 0,
+  webdriver: 1 << 1,
+  plugins_empty: 1 << 2,
+  languages_empty: 1 << 3,
+  hardware_concurrency_missing: 1 << 4,
+  touch_points_invalid: 1 << 5,
+  visibility_changes_high: 1 << 6,
+  elapsed_too_fast: 1 << 7,
+  audio_fingerprint_unavailable: 1 << 8,
+  webgl_fingerprint_unavailable: 1 << 9,
+  canvas_fingerprint_unavailable: 1 << 10,
+};
+
+async function evaluationBody(sessionId: string, overrides: Partial<EnvironmentSignals> = {}) {
+  const signals: EnvironmentSignals = {
+    wasmAvailable: true,
+    webdriver: false,
+    plugins: 3,
+    languages: 2,
+    hardwareConcurrency: 8,
+    touchPoints: 0,
+    visibilityChanges: 0,
+    elapsedMs: 500,
+    fingerprintCapabilities: 7,
+    ...overrides,
+  };
+  const stored = await prisma.widgetSession.findUniqueOrThrow({ where: { id: sessionId } });
+  const challenge = JSON.parse(stored.integrity_challenge!) as IntegrityChallenge;
+  const fingerprint = TEST_FINGERPRINT;
+  const frameDeltas = Array.from({ length: challenge.sampleCount }, (_, index) => 162 + (index % 7));
+  const integrity = {
+    challengeId: challenge.id,
+    response: "",
+    frameDeltas,
+    trustedActivation: true,
+    focusState: true,
+  };
+  integrity.response = expectedIntegrityResponse(challenge, fingerprint, integrity, signals.visibilityChanges);
+  const score = scoreEnvironmentDetails(signals);
+  return {
+    ...signals,
+    wasmReport: {
+      version: 2,
+      score: score.score,
+      deductionMask: score.deductions.reduce((mask, item) => mask | (scoreBits[item.factor] || 0), 0),
+      fingerprint,
+      integrity,
+    },
+  };
 }
 
 async function setupSite() {
@@ -180,19 +235,22 @@ describe("captcha service HTTP protocol", () => {
     const iframeUrl = new URL(sessionResponse.body.iframeUrl);
     const sessionId = iframeUrl.searchParams.get("session")!;
     const widgetToken = new URLSearchParams(iframeUrl.hash.slice(1)).get("token")!;
+    const bootstrap = await request(app)
+      .get(`/v1/widget/sessions/${sessionId}/bootstrap`)
+      .set("authorization", `Bearer ${widgetToken}`);
+    expect(bootstrap.status).toBe(200);
+    expect(bootstrap.body.fingerprintSalt).toMatch(/^[A-Za-z0-9_-]{22}$/);
+    expect(bootstrap.body.integrityChallenge).toMatchObject({
+      id: expect.stringMatching(/^[A-Za-z0-9_-]{22}$/),
+      program: expect.stringMatching(/^[A-Za-z0-9_-]+$/),
+      sampleCount: expect.any(Number),
+      minimumDurationMs: expect.any(Number),
+    });
+    const browserRisk = await evaluationBody(sessionId);
     const evaluate = await request(app)
       .post(`/v1/widget/sessions/${sessionId}/evaluate`)
       .set("authorization", `Bearer ${widgetToken}`)
-      .send({
-        wasmAvailable: true,
-        webdriver: false,
-        plugins: 3,
-        languages: 2,
-        hardwareConcurrency: 8,
-        touchPoints: 0,
-        visibilityChanges: 0,
-        elapsedMs: 500,
-      });
+      .send(browserRisk);
     expect(evaluate.status).toBe(200);
     expect(evaluate.body.decision).toBe("pass");
 
@@ -204,6 +262,8 @@ describe("captcha service HTTP protocol", () => {
       .send(redeemBody);
     expect(redeem.status).toBe(200);
     expect(redeem.body.success).toBe(true);
+    expect(redeem.body.machineFingerprint).toMatch(/^[A-Za-z0-9_-]{43}$/);
+    expect(redeem.body.wasmIntegrityVerified).toBe(true);
 
     const secondRedeem = await request(app).post(redeemPath)
       .set(signatureHeaders(siteId, secret, "POST", redeemPath, redeemBody))
@@ -232,19 +292,11 @@ describe("captcha service HTTP protocol", () => {
     expect(asset.status).toBe(201);
 
     const { sessionId, widgetToken } = await createSession(siteId, secret, { level: "low", credentialFailure: true });
+    const browserRisk = await evaluationBody(sessionId);
     const evaluate = await request(app)
       .post(`/v1/widget/sessions/${sessionId}/evaluate`)
       .set("authorization", `Bearer ${widgetToken}`)
-      .send({
-        wasmAvailable: true,
-        webdriver: false,
-        plugins: 3,
-        languages: 2,
-        hardwareConcurrency: 8,
-        touchPoints: 0,
-        visibilityChanges: 0,
-        elapsedMs: 500,
-      });
+      .send(browserRisk);
     expect(evaluate.status).toBe(200);
     expect(evaluate.body.decision).toBe("text");
 
@@ -272,19 +324,18 @@ describe("captcha service HTTP protocol", () => {
       .send({ kind: "slider_background", label: "Grid", payload: background });
     expect(asset.status).toBe(201);
     const { sessionId, widgetToken } = await createSession(siteId, secret, { level: "high", credentialFailure: false });
+    const browserRisk = await evaluationBody(sessionId, {
+      webdriver: true,
+      plugins: 0,
+      languages: 0,
+      hardwareConcurrency: 0,
+      visibilityChanges: 8,
+      elapsedMs: 20,
+    });
     const evaluate = await request(app)
       .post(`/v1/widget/sessions/${sessionId}/evaluate`)
       .set("authorization", `Bearer ${widgetToken}`)
-      .send({
-        wasmAvailable: false,
-        webdriver: true,
-        plugins: 0,
-        languages: 0,
-        hardwareConcurrency: 0,
-        touchPoints: 0,
-        visibilityChanges: 8,
-        elapsedMs: 20,
-      });
+      .send(browserRisk);
     expect(evaluate.status).toBe(200);
     expect(evaluate.body.decision).toBe("slider");
     expect(evaluate.body.backgroundImage).toMatch(/^data:image\/webp;base64,/);
@@ -310,6 +361,10 @@ describe("captcha service HTTP protocol", () => {
     expect(stored?.challenge_digest).toMatch(/^[A-Za-z0-9_-]{43}$/);
     expect(stored?.challenge_attempts).toBe(1);
     expect(JSON.parse(stored!.slider_motion_profile!)).toEqual(evaluate.body.motionMap);
+    expect(stored?.machine_fingerprint).toMatch(/^[A-Za-z0-9_-]{43}$/);
+    expect(stored?.fingerprint_version).toBe(2);
+    expect(stored?.fingerprint_capabilities).toBe(7);
+    expect(stored?.wasm_integrity_verified).toBe(true);
   });
 
   it("creates slider background assets through the authenticated batch endpoint", async () => {
@@ -327,6 +382,91 @@ describe("captcha service HTTP protocol", () => {
     expect(response.body.assets).toHaveLength(2);
     expect(await prisma.challengeAsset.count({ where: { kind: "slider_background" } })).toBe(2);
     expect(await prisma.securityEvent.findFirst({ where: { action: "asset.batch_create" } })).not.toBeNull();
+  });
+
+  it("raises risk when one site-scoped machine fingerprint churns through accounts and failures", async () => {
+    const { siteId, secret } = await setupSite();
+    const scopedFingerprint = scopeMachineFingerprint(siteId, TEST_FINGERPRINT);
+    await prisma.widgetSession.createMany({
+      data: Array.from({ length: 4 }, (_, index) => ({
+        site_id: siteId,
+        token_digest: digest(crypto.randomBytes(32)),
+        parent_origin: "https://login.example.com",
+        action: "login",
+        username_digest: `account-${index}-${"u".repeat(24)}`,
+        policy_version: 1,
+        level: "medium",
+        machine_fingerprint: scopedFingerprint,
+        fingerprint_version: 2,
+        wasm_integrity_verified: true,
+        state: "failed",
+        expires_at: new Date(Date.now() + 60_000),
+      })),
+    });
+    const { sessionId, widgetToken } = await createSession(siteId, secret, { level: "medium", credentialFailure: false });
+    const evaluate = await request(app)
+      .post(`/v1/widget/sessions/${sessionId}/evaluate`)
+      .set("authorization", `Bearer ${widgetToken}`)
+      .send(await evaluationBody(sessionId));
+    expect(evaluate.status).toBe(200);
+    expect(evaluate.body.decision).toBe("text");
+    const stored = await prisma.widgetSession.findUniqueOrThrow({ where: { id: sessionId } });
+    expect(stored.risk_score).toBe(65);
+    expect(stored.machine_fingerprint).toBe(scopedFingerprint);
+  });
+
+  it("requires a human challenge when WASM integrity evidence is unavailable", async () => {
+    const { siteId, secret } = await setupSite();
+    const { sessionId, widgetToken } = await createSession(siteId, secret, { level: "low", credentialFailure: false });
+    const evaluate = await request(app)
+      .post(`/v1/widget/sessions/${sessionId}/evaluate`)
+      .set("authorization", `Bearer ${widgetToken}`)
+      .send({
+        wasmAvailable: false,
+        webdriver: false,
+        plugins: 3,
+        languages: 2,
+        hardwareConcurrency: 8,
+        touchPoints: 0,
+        visibilityChanges: 0,
+        elapsedMs: 500,
+        fingerprintCapabilities: 0,
+      });
+    expect(evaluate.status).toBe(200);
+    expect(evaluate.body.decision).toBe("text");
+    const stored = await prisma.widgetSession.findUniqueOrThrow({ where: { id: sessionId } });
+    expect(stored.risk_score).toBe(18);
+    expect(stored.machine_fingerprint).toBeNull();
+    expect(stored.wasm_integrity_verified).toBe(false);
+  });
+
+  it("rotates a consumed integrity challenge and rejects its response as trusted evidence on replay", async () => {
+    const { siteId, secret } = await setupSite();
+    const { sessionId, widgetToken } = await createSession(siteId, secret, { level: "low", credentialFailure: true });
+    const firstChallenge = await prisma.widgetSession.findUniqueOrThrow({ where: { id: sessionId } });
+    const firstChallengeId = (JSON.parse(firstChallenge.integrity_challenge!) as IntegrityChallenge).id;
+    const browserRisk = await evaluationBody(sessionId);
+    const firstEvaluation = await request(app)
+      .post(`/v1/widget/sessions/${sessionId}/evaluate`)
+      .set("authorization", `Bearer ${widgetToken}`)
+      .send(browserRisk);
+    expect(firstEvaluation.status).toBe(200);
+    expect((await prisma.widgetSession.findUniqueOrThrow({ where: { id: sessionId } })).integrity_challenge).toBeNull();
+
+    const bootstrap = await request(app)
+      .get(`/v1/widget/sessions/${sessionId}/bootstrap`)
+      .set("authorization", `Bearer ${widgetToken}`);
+    expect(bootstrap.status).toBe(200);
+    expect(bootstrap.body.integrityChallenge.id).not.toBe(firstChallengeId);
+
+    const replay = await request(app)
+      .post(`/v1/widget/sessions/${sessionId}/evaluate`)
+      .set("authorization", `Bearer ${widgetToken}`)
+      .send(browserRisk);
+    expect(replay.status).toBe(200);
+    const replayed = await prisma.widgetSession.findUniqueOrThrow({ where: { id: sessionId } });
+    expect(replayed.wasm_integrity_verified).toBe(false);
+    expect(replayed.machine_fingerprint).toBeNull();
   });
 
   it("switches a slider session to the accessible text fallback", async () => {
@@ -389,13 +529,21 @@ describe("captcha service HTTP protocol", () => {
       const iframeUrl = new URL(created.body.iframeUrl);
       const sessionId = iframeUrl.searchParams.get("session")!;
       const widgetToken = new URLSearchParams(iframeUrl.hash.slice(1)).get("token")!;
+      const browserRisk = await evaluationBody(sessionId);
       const evaluate = await request(app)
         .post(`/v1/widget/sessions/${sessionId}/evaluate`)
         .set("authorization", `Bearer ${widgetToken}`)
-        .send({ wasmAvailable: true, webdriver: false, plugins: 3, languages: 2, hardwareConcurrency: 8, touchPoints: 0, visibilityChanges: 0, elapsedMs: 500 });
+        .send(browserRisk);
       expect(evaluate.status).toBe(200);
       expect(evaluate.body.decision).toBe(challengeType);
-      expect(evaluate.body.diagnostic).toEqual({ score: 100, deductions: [] });
+      expect(evaluate.body.diagnostic).toEqual({
+        score: 100,
+        deductions: [],
+        machineFingerprint: expect.stringMatching(/^[A-Za-z0-9_-]{43}$/),
+        fingerprintVersion: 2,
+        fingerprintCapabilities: 7,
+        wasmIntegrityVerified: true,
+      });
 
       let verifyBody: { answer: string | number; trajectory?: Array<{ x: number; y: number; t: number }> } = { answer: "a2b3c4" };
       if (challengeType === "slider") {
@@ -429,10 +577,11 @@ describe("captcha service HTTP protocol", () => {
   it("locks a challenge session after five rejected answers", async () => {
     const { siteId, secret } = await setupSite();
     const { sessionId, widgetToken } = await createSession(siteId, secret, { level: "low", credentialFailure: true });
+    const browserRisk = await evaluationBody(sessionId);
     await request(app)
       .post(`/v1/widget/sessions/${sessionId}/evaluate`)
       .set("authorization", `Bearer ${widgetToken}`)
-      .send({ wasmAvailable: true, webdriver: false, plugins: 3, languages: 2, hardwareConcurrency: 8, touchPoints: 0, visibilityChanges: 0, elapsedMs: 500 });
+      .send(browserRisk);
     for (let attempt = 0; attempt < 5; attempt += 1) {
       const rejected = await request(app)
         .post(`/v1/widget/sessions/${sessionId}/verify`)
@@ -448,10 +597,11 @@ describe("captcha service HTTP protocol", () => {
   it("locks a challenge session after five concurrent rejected answers", async () => {
     const { siteId, secret } = await setupSite();
     const { sessionId, widgetToken } = await createSession(siteId, secret, { level: "low", credentialFailure: true });
+    const browserRisk = await evaluationBody(sessionId);
     await request(app)
       .post(`/v1/widget/sessions/${sessionId}/evaluate`)
       .set("authorization", `Bearer ${widgetToken}`)
-      .send({ wasmAvailable: true, webdriver: false, plugins: 3, languages: 2, hardwareConcurrency: 8, touchPoints: 0, visibilityChanges: 0, elapsedMs: 500 });
+      .send(browserRisk);
     const rejected = await Promise.all(Array.from({ length: 5 }, () => request(app)
       .post(`/v1/widget/sessions/${sessionId}/verify`)
       .set("authorization", `Bearer ${widgetToken}`)

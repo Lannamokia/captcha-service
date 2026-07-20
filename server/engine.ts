@@ -13,11 +13,15 @@ export interface EnvironmentSignals {
   touchPoints: number;
   visibilityChanges: number;
   elapsedMs: number;
+  fingerprintCapabilities?: number;
 }
 
 export interface ScoreDeduction {
   factor: "wasm_unavailable" | "webdriver" | "plugins_empty" | "languages_empty" |
-    "hardware_concurrency_missing" | "touch_points_invalid" | "visibility_changes_high" | "elapsed_too_fast";
+    "hardware_concurrency_missing" | "touch_points_invalid" | "visibility_changes_high" | "elapsed_too_fast" |
+    "audio_fingerprint_unavailable" | "webgl_fingerprint_unavailable" | "canvas_fingerprint_unavailable" |
+    "wasm_report_invalid" | "wasm_score_mismatch" | "integrity_challenge_failed" |
+    "fingerprint_account_churn" | "fingerprint_failure_history";
   points: number;
 }
 
@@ -41,6 +45,11 @@ export function scoreEnvironmentDetails(signals: EnvironmentSignals): Environmen
   deduct(signals.touchPoints < 0, "touch_points_invalid", 5);
   deduct(signals.visibilityChanges > 5, "visibility_changes_high", 8);
   deduct(signals.elapsedMs < 150, "elapsed_too_fast", 20);
+  if (signals.fingerprintCapabilities !== undefined) {
+    deduct((signals.fingerprintCapabilities & 1) === 0, "audio_fingerprint_unavailable", 10);
+    deduct((signals.fingerprintCapabilities & 2) === 0, "webgl_fingerprint_unavailable", 12);
+    deduct((signals.fingerprintCapabilities & 4) === 0, "canvas_fingerprint_unavailable", 5);
+  }
   const total = deductions.reduce((sum, item) => sum + item.points, 0);
   return { score: Math.max(0, Math.min(100, 100 - total)), deductions };
 }

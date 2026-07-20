@@ -42,6 +42,12 @@ model WidgetSession {
   theme                    String   @default("light")
   brand_color              String   @default("#2563eb")
   risk_score               Int?
+  machine_fingerprint      String?
+  fingerprint_version      Int?
+  fingerprint_capabilities Int?
+  wasm_score               Int?
+  wasm_integrity_verified  Boolean?
+  integrity_challenge      String?
   test_challenge_type      String?
   challenge_type           String?
   challenge_answer_digest  String?
@@ -59,6 +65,7 @@ model WidgetSession {
   site Site @relation(fields: [site_id], references: [id], onDelete: Cascade)
 
   @@index([site_id, created_at])
+  @@index([site_id, machine_fingerprint, created_at])
   @@index([state, expires_at])
 }
 

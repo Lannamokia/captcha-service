@@ -36,6 +36,20 @@ export function challengeDigest(value: string): string {
   return crypto.createHmac("sha256", key).update(value.toUpperCase()).digest("base64url");
 }
 
+export function fingerprintSalt(siteId: string): string {
+  return crypto.createHmac("sha256", key)
+    .update(`fingerprint-salt/v2\0${siteId}`)
+    .digest()
+    .subarray(0, 16)
+    .toString("base64url");
+}
+
+export function scopeMachineFingerprint(siteId: string, fingerprint: string): string {
+  return crypto.createHmac("sha256", key)
+    .update(`machine-fingerprint/v2\0${siteId}\0${fingerprint.toLowerCase()}`)
+    .digest("base64url");
+}
+
 export function safeEqual(left: string, right: string): boolean {
   const a = Buffer.from(left);
   const b = Buffer.from(right);

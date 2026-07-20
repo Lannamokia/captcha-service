@@ -177,6 +177,13 @@ code, .eyebrow, .section-index, .widget-footer, .console-brand small, .nav-meta 
 .score-track { height: 7px; margin-top: 19px; overflow: hidden; background: #dfe4e6; }
 .score-track i { display: block; height: 100%; background: var(--success); transition: width .25s ease; }
 .score-verdict { margin-top: 8px; color: var(--muted); font-size: 11px; }
+.fingerprint-report { display: grid; gap: 8px; margin-top: 18px; padding-top: 14px; border-top: 1px solid var(--line); }
+.fingerprint-heading, .fingerprint-meta { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.fingerprint-heading > span { display: inline-flex; align-items: center; gap: 7px; color: var(--muted); font-size: 11px; font-weight: 600; }
+.fingerprint-heading b { color: var(--danger); font: 600 9px "IBM Plex Mono", monospace; }
+.fingerprint-heading b.verified { color: var(--success); }
+.fingerprint-report code { min-height: 42px; padding: 8px; background: #202a31; color: #cde9e6; overflow-wrap: anywhere; font-size: 9px; line-height: 1.45; }
+.fingerprint-meta { color: var(--muted); font: 600 8px "IBM Plex Mono", monospace; }
 .deduction-list { display: grid; gap: 9px; margin-top: 24px; padding-top: 14px; border-top: 1px solid var(--line); }
 .deduction-ok, .deduction-item { min-height: 32px; display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 11px; }
 .deduction-ok { justify-content: flex-start; color: var(--success); }

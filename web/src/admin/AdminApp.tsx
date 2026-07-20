@@ -8,6 +8,7 @@ import {
   Copy,
   Database,
   FileImage,
+  Fingerprint,
   FlaskConical,
   Gauge,
   KeyRound,
@@ -66,6 +67,14 @@ const scoreFactorLabels: Record<string, string> = {
   touch_points_invalid: "触点数据异常",
   visibility_changes_high: "页面可见性频繁变化",
   elapsed_too_fast: "环境采集耗时过短",
+  audio_fingerprint_unavailable: "音频指纹不可用",
+  webgl_fingerprint_unavailable: "WebGL 指纹不可用",
+  canvas_fingerprint_unavailable: "Canvas 指纹不可用",
+  wasm_report_invalid: "WASM 风控报告无效",
+  wasm_score_mismatch: "WASM 与服务端评分不一致",
+  integrity_challenge_failed: "动态完整性挑战失败",
+  fingerprint_account_churn: "同一机器关联账号过多",
+  fingerprint_failure_history: "同一机器近期失败过多",
 };
 
 const phaseLabels: Record<TestPhase, string> = {
@@ -164,6 +173,10 @@ function Console({ token, onLogout }: { token: string; onLogout: () => void }) {
   const [testSession, setTestSession] = useState<TestSession | null>(null);
   const [testScore, setTestScore] = useState<number | null>(null);
   const [testDeductions, setTestDeductions] = useState<ScoreDeduction[]>([]);
+  const [testFingerprint, setTestFingerprint] = useState("");
+  const [testFingerprintVersion, setTestFingerprintVersion] = useState<number | null>(null);
+  const [testFingerprintCapabilities, setTestFingerprintCapabilities] = useState(0);
+  const [testIntegrityVerified, setTestIntegrityVerified] = useState<boolean | null>(null);
   const [testError, setTestError] = useState("");
   const [iframeHeight, setIframeHeight] = useState(260);
   const [coverage, setCoverage] = useState<Record<TestMode, boolean>>({ text: false, slider: false });
@@ -216,6 +229,10 @@ function Console({ token, onLogout }: { token: string; onLogout: () => void }) {
             typeof item === "object" && item !== null && typeof item.factor === "string" && typeof item.points === "number"
           )));
         }
+        if (typeof data.machineFingerprint === "string") setTestFingerprint(data.machineFingerprint);
+        if (typeof data.fingerprintVersion === "number") setTestFingerprintVersion(data.fingerprintVersion);
+        if (typeof data.fingerprintCapabilities === "number") setTestFingerprintCapabilities(data.fingerprintCapabilities);
+        if (typeof data.wasmIntegrityVerified === "boolean") setTestIntegrityVerified(data.wasmIntegrityVerified);
         setTestPhase("challenging");
         return;
       }
@@ -360,6 +377,10 @@ function Console({ token, onLogout }: { token: string; onLogout: () => void }) {
     setTestPhase("idle");
     setTestScore(null);
     setTestDeductions([]);
+    setTestFingerprint("");
+    setTestFingerprintVersion(null);
+    setTestFingerprintCapabilities(0);
+    setTestIntegrityVerified(null);
     setTestError("");
     setIframeHeight(260);
     redeemingRef.current = false;
@@ -512,6 +533,15 @@ function Console({ token, onLogout }: { token: string; onLogout: () => void }) {
                 <div className="score-heading"><span><Gauge size={18} /> 浏览器可信评分</span><strong>{testScore === null ? "--" : testScore}<small>/100</small></strong></div>
                 <div className="score-track" aria-label="浏览器可信评分"><i style={{ width: `${testScore || 0}%` }} /></div>
                 <div className="score-verdict">{testScore === null ? "等待环境采集" : testScore >= 80 ? "环境可信" : testScore >= 60 ? "需要关注" : "高风险环境"}</div>
+                <div className="fingerprint-report">
+                  <div className="fingerprint-heading"><span><Fingerprint size={16} /> 站点机器指纹</span><b className={testIntegrityVerified ? "verified" : "unverified"}>{testIntegrityVerified === null ? "等待" : testIntegrityVerified ? "挑战通过" : "挑战失败"}</b></div>
+                  <code>{testFingerprint || "--"}</code>
+                  <div className="fingerprint-meta"><span>WASM v{testFingerprintVersion ?? "--"}</span><span>{[
+                    testFingerprintCapabilities & 1 ? "AUDIO" : null,
+                    testFingerprintCapabilities & 2 ? "WEBGL" : null,
+                    testFingerprintCapabilities & 4 ? "CANVAS" : null,
+                  ].filter(Boolean).join(" / ") || "NO SIGNAL"}</span></div>
+                </div>
                 <div className="deduction-list">
                   <span className="eyebrow">SCORE BREAKDOWN</span>
                   {testScore !== null && testDeductions.length === 0 && <div className="deduction-ok"><CheckCircle2 size={15} /> 未触发扣分项</div>}

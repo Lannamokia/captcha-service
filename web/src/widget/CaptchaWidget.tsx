@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties } from "react";
 import { CheckCircle2, LoaderCircle, RefreshCw, ShieldCheck, SlidersHorizontal, Type } from "lucide-react";
 import { api } from "../api";
+import { collectBrowserRisk, type IntegrityChallenge } from "./browser-risk";
 
 type Bootstrap = {
   sessionId: string;
@@ -10,11 +11,17 @@ type Bootstrap = {
   brandColor: string;
   expiresAt: string;
   protocolVersion: 1;
+  fingerprintSalt: string;
+  integrityChallenge: IntegrityChallenge;
 };
 
 type Diagnostic = {
   score: number;
   deductions: Array<{ factor: string; points: number }>;
+  machineFingerprint?: string;
+  fingerprintVersion?: number;
+  fingerprintCapabilities?: number;
+  wasmIntegrityVerified?: boolean;
 };
 
 type Challenge = (
@@ -86,37 +93,30 @@ export function CaptchaWidget() {
     return () => observer.disconnect();
   }, [bootstrap, post]);
 
-  async function wasmProbe() {
-    try {
-      const instance = await WebAssembly.instantiate(new Uint8Array([
-        0, 97, 115, 109, 1, 0, 0, 0, 1, 7, 1, 96, 2, 127, 127, 1, 127,
-        3, 2, 1, 0, 7, 7, 1, 3, 97, 100, 100, 0, 0, 10, 9, 1, 7, 0,
-        32, 0, 32, 1, 106, 11,
-      ]));
-      const add = (instance.instance.exports as { add?: (left: number, right: number) => number }).add;
-      return add?.(19, 23) === 42;
-    } catch { return false; }
-  }
-
-  async function evaluate() {
+  async function evaluate(trustedActivation = false) {
     setPhase("loading");
     setError("");
     const started = performance.now();
     try {
+      if (!bootstrap) throw new Error("WIDGET_NOT_READY");
+      const currentBootstrap = await api<Bootstrap>(
+        `/v1/widget/sessions/${sessionId}/bootstrap`,
+        {},
+        tokenRef.current,
+      );
+      setBootstrap(currentBootstrap);
+      const browserRisk = await collectBrowserRisk(
+        currentBootstrap.fingerprintSalt,
+        currentBootstrap.integrityChallenge,
+        visibilityChanges.current,
+        trustedActivation,
+        started,
+      );
       const result = await api<Challenge | ({ decision: "pass"; completionToken: string; parentOrigin: string } & { diagnostic?: Diagnostic })>(
         `/v1/widget/sessions/${sessionId}/evaluate`,
         {
           method: "POST",
-          body: JSON.stringify({
-            wasmAvailable: await wasmProbe(),
-            webdriver: navigator.webdriver,
-            plugins: navigator.plugins.length,
-            languages: navigator.languages.length,
-            hardwareConcurrency: navigator.hardwareConcurrency || 0,
-            touchPoints: navigator.maxTouchPoints || 0,
-            visibilityChanges: visibilityChanges.current,
-            elapsedMs: performance.now() - started + 180,
-          }),
+          body: JSON.stringify(browserRisk),
         },
         tokenRef.current
       );
@@ -125,6 +125,10 @@ export function CaptchaWidget() {
           score: result.diagnostic.score,
           deductions: result.diagnostic.deductions,
           challengeType: result.decision,
+          machineFingerprint: result.diagnostic.machineFingerprint,
+          fingerprintVersion: result.diagnostic.fingerprintVersion,
+          fingerprintCapabilities: result.diagnostic.fingerprintCapabilities,
+          wasmIntegrityVerified: result.diagnostic.wasmIntegrityVerified,
         });
       }
       if (result.decision === "pass") {
@@ -181,7 +185,7 @@ export function CaptchaWidget() {
       </header>
 
       {phase === "idle" && (
-        <button className="primary-button widget-action" onClick={() => void evaluate()}>
+        <button className="primary-button widget-action" onClick={(event) => void evaluate(event.nativeEvent.isTrusted)}>
           <ShieldCheck size={17} /> 开始验证
         </button>
       )}
@@ -192,7 +196,7 @@ export function CaptchaWidget() {
           <img className="captcha-image" src={challenge.imageData} alt="验证码图像" />
           <div className="inline-control">
             <input value={textAnswer} autoCapitalize="characters" maxLength={6} aria-label="验证码" onChange={(event) => setTextAnswer(event.target.value.toUpperCase().replace(/[^A-Z0-9]/g, ""))} />
-            <button className="icon-button" title="刷新" aria-label="刷新" onClick={() => void evaluate()}><RefreshCw size={17} /></button>
+            <button className="icon-button" title="刷新" aria-label="刷新" onClick={(event) => void evaluate(event.nativeEvent.isTrusted)}><RefreshCw size={17} /></button>
           </div>
           <button className="primary-button" disabled={textAnswer.length !== 6} onClick={() => void submit()}>提交验证</button>
         </section>
@@ -240,7 +244,7 @@ export function CaptchaWidget() {
         </section>
       )}
       {phase === "complete" && <div className="widget-complete"><CheckCircle2 size={25} /><strong>验证完成</strong></div>}
-      {phase === "error" && <button className="secondary-button widget-action" onClick={() => void evaluate()}><RefreshCw size={17} /> 重试</button>}
+      {phase === "error" && <button className="secondary-button widget-action" onClick={(event) => void evaluate(event.nativeEvent.isTrusted)}><RefreshCw size={17} /> 重试</button>}
       {error && <p className="inline-error" role="alert">{error}</p>}
 
       <footer className="widget-footer"><span>CAPTCHA SERVICE</span><span>v1</span></footer>

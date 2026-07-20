@@ -9,7 +9,7 @@ import { z, ZodError } from "zod";
 import { config } from "./config.js";
 import { prisma } from "./database.js";
 import { type AdminRequest, requireAdmin, signAdminToken } from "./admin-auth.js";
-import { challengeDigest, digest, encryptSecret, opaqueToken, safeEqual } from "./crypto.js";
+import { challengeDigest, digest, encryptSecret, fingerprintSalt, opaqueToken, safeEqual, scopeMachineFingerprint } from "./crypto.js";
 import { type RawRequest, requireSiteSignature } from "./hmac.js";
 import {
   analyzeTrajectory,
@@ -18,11 +18,19 @@ import {
   scoreEnvironmentDetails,
   selectChallenge,
   type EnvironmentSignals,
+  type EnvironmentScore,
+  type ScoreDeduction,
   type TrajectoryPoint,
 } from "./engine.js";
 import { renderCaptchaPng } from "./captcha-image.js";
 import { renderSliderPuzzle } from "./puzzle-image.js";
 import { createMotionMap, mapMotionPosition } from "./motion-profile.js";
+import {
+  createIntegrityChallenge,
+  validateIntegrityEvidence,
+  type IntegrityChallenge,
+  type IntegrityEvidence,
+} from "./integrity-challenge.js";
 import { pingNonceStore } from "./nonce-store.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -56,6 +64,20 @@ const evaluateInput = z.object({
   touchPoints: z.number().int().min(0).max(100),
   visibilityChanges: z.number().int().min(0).max(1000),
   elapsedMs: z.number().min(0).max(600_000),
+  fingerprintCapabilities: z.number().int().min(0).max(7).optional(),
+  wasmReport: z.object({
+    version: z.number().int().min(1).max(100),
+    score: z.number().int().min(0).max(100),
+    deductionMask: z.number().int().min(0).max(0x7fffffff),
+    fingerprint: z.string().regex(/^[0-9a-f]{64}$/),
+    integrity: z.object({
+      challengeId: z.string().regex(/^[A-Za-z0-9_-]{22}$/),
+      response: z.string().regex(/^[0-9a-f]{16}$/),
+      frameDeltas: z.array(z.number().int().min(1).max(20_000)).min(1).max(64),
+      trustedActivation: z.boolean(),
+      focusState: z.boolean(),
+    }),
+  }).optional(),
 });
 
 const verifyInput = z.object({
@@ -95,6 +117,92 @@ const assetUpdateInput = z.object({
 
 function asyncRoute(handler: (req: Request, res: Response) => Promise<void>) {
   return (req: Request, res: Response, next: NextFunction) => handler(req, res).catch(next);
+}
+
+const deductionBits: Partial<Record<ScoreDeduction["factor"], number>> = {
+  wasm_unavailable: 1 << 0,
+  webdriver: 1 << 1,
+  plugins_empty: 1 << 2,
+  languages_empty: 1 << 3,
+  hardware_concurrency_missing: 1 << 4,
+  touch_points_invalid: 1 << 5,
+  visibility_changes_high: 1 << 6,
+  elapsed_too_fast: 1 << 7,
+  audio_fingerprint_unavailable: 1 << 8,
+  webgl_fingerprint_unavailable: 1 << 9,
+  canvas_fingerprint_unavailable: 1 << 10,
+};
+
+function scoreDeductionMask(details: EnvironmentScore): number {
+  return details.deductions.reduce((mask, item) => mask | (deductionBits[item.factor] || 0), 0);
+}
+
+function withDeductions(details: EnvironmentScore, additions: ScoreDeduction[]): EnvironmentScore {
+  return {
+    score: Math.max(0, details.score - additions.reduce((total, item) => total + item.points, 0)),
+    deductions: [...details.deductions, ...additions],
+  };
+}
+
+function parseIntegrityChallenge(value: string | null): IntegrityChallenge | null {
+  if (!value) return null;
+  try {
+    const parsed = JSON.parse(value) as IntegrityChallenge;
+    const programLength = typeof parsed?.program === "string"
+      ? Buffer.from(parsed.program, "base64url").length
+      : 0;
+    return parsed &&
+      typeof parsed.id === "string" && /^[A-Za-z0-9_-]{22}$/.test(parsed.id) &&
+      typeof parsed.program === "string" && programLength >= 8 && programLength <= 128 &&
+      Number.isInteger(parsed.seed) && parsed.seed >= 0 && parsed.seed <= 0xffffffff &&
+      Number.isInteger(parsed.sampleCount) && parsed.sampleCount >= 1 && parsed.sampleCount <= 64 &&
+      Number.isInteger(parsed.minimumDurationMs) && parsed.minimumDurationMs >= 1 && parsed.minimumDurationMs <= 10_000
+      ? parsed
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+type StoredIntegrityChallenge = { challenge: IntegrityChallenge; serialized: string };
+
+async function ensureIntegrityChallenge(sessionId: string, stored: string | null): Promise<StoredIntegrityChallenge> {
+  const existing = parseIntegrityChallenge(stored);
+  if (existing && stored) return { challenge: existing, serialized: stored };
+  const created = createIntegrityChallenge();
+  const serialized = JSON.stringify(created);
+  const claimed = await prisma.widgetSession.updateMany({
+    where: { id: sessionId, integrity_challenge: stored },
+    data: { integrity_challenge: serialized },
+  });
+  if (claimed.count === 1) return { challenge: created, serialized };
+  const current = await prisma.widgetSession.findUnique({ where: { id: sessionId }, select: { integrity_challenge: true } });
+  const currentChallenge = parseIntegrityChallenge(current?.integrity_challenge || null);
+  if (!currentChallenge || !current?.integrity_challenge) throw new Error("INTEGRITY_CHALLENGE_UNAVAILABLE");
+  return { challenge: currentChallenge, serialized: current.integrity_challenge };
+}
+
+async function fingerprintHistoryDeductions(siteId: string, sessionId: string, fingerprint: string | null): Promise<ScoreDeduction[]> {
+  if (!fingerprint) return [];
+  const sessions = await prisma.widgetSession.findMany({
+    where: {
+      site_id: siteId,
+      machine_fingerprint: fingerprint,
+      id: { not: sessionId },
+      created_at: { gte: new Date(Date.now() - 24 * 60 * 60 * 1000) },
+    },
+    select: { username_digest: true, state: true },
+    orderBy: { created_at: "desc" },
+    take: 100,
+  });
+  const additions: ScoreDeduction[] = [];
+  if (new Set(sessions.map((item) => item.username_digest)).size >= 4) {
+    additions.push({ factor: "fingerprint_account_churn", points: 20 });
+  }
+  if (sessions.filter((item) => item.state === "failed" || item.state === "expired").length >= 3) {
+    additions.push({ factor: "fingerprint_failure_history", points: 15 });
+  }
+  return additions;
 }
 
 function bearer(req: Request): string | null {
@@ -236,6 +344,7 @@ export function createApp() {
       return;
     }
     const token = opaqueToken();
+    const integrityChallenge = createIntegrityChallenge();
     const session = await prisma.widgetSession.create({
       data: {
         site_id: site.id,
@@ -248,6 +357,7 @@ export function createApp() {
         credential_failure: input.credentialFailure,
         theme: input.theme,
         brand_color: input.brandColor,
+        integrity_challenge: JSON.stringify(integrityChallenge),
         expires_at: new Date(Date.now() + SESSION_TTL_MS),
       },
     });
@@ -261,6 +371,7 @@ export function createApp() {
       return;
     }
     const token = opaqueToken();
+    const integrityChallenge = createIntegrityChallenge();
     const session = await prisma.widgetSession.create({
       data: {
         site_id: req.captchaSite!.id,
@@ -274,6 +385,7 @@ export function createApp() {
         theme: input.theme,
         brand_color: input.brandColor,
         test_challenge_type: input.challengeType,
+        integrity_challenge: JSON.stringify(integrityChallenge),
         expires_at: new Date(Date.now() + SESSION_TTL_MS),
       },
     });
@@ -302,7 +414,15 @@ export function createApp() {
       res.status(400).json({ success: false });
       return;
     }
-    res.json({ success: true, sessionRef: session.id, policyVersion: session.policy_version });
+    res.json({
+      success: true,
+      sessionRef: session.id,
+      policyVersion: session.policy_version,
+      riskScore: session.risk_score,
+      machineFingerprint: session.machine_fingerprint,
+      fingerprintVersion: session.fingerprint_version,
+      wasmIntegrityVerified: session.wasm_integrity_verified,
+    });
   }));
 
   app.get("/v1/sites/:siteId/health", requireSiteSignature, asyncRoute(async (req: RawRequest, res) => {
@@ -313,6 +433,7 @@ export function createApp() {
   app.get("/v1/widget/sessions/:id/bootstrap", asyncRoute(async (req, res) => {
     const session = await requireWidgetSession(req, res);
     if (!session) return;
+    const { challenge: integrityChallenge } = await ensureIntegrityChallenge(session.id, session.integrity_challenge);
     res.json({
       sessionId: session.id,
       parentOrigin: session.parent_origin,
@@ -320,6 +441,8 @@ export function createApp() {
       brandColor: session.brand_color,
       expiresAt: session.expires_at,
       protocolVersion: 1,
+      fingerprintSalt: fingerprintSalt(session.site_id),
+      integrityChallenge,
     });
   }));
 
@@ -334,13 +457,75 @@ export function createApp() {
       res.status(429).json({ error: "CHALLENGE_ATTEMPTS_EXHAUSTED" });
       return;
     }
-    const signals = evaluateInput.parse(req.body) as EnvironmentSignals;
-    const scoreDetails = scoreEnvironmentDetails(signals);
+    const input = evaluateInput.parse(req.body);
+    const signals: EnvironmentSignals = {
+      wasmAvailable: input.wasmAvailable,
+      webdriver: input.webdriver,
+      plugins: input.plugins,
+      languages: input.languages,
+      hardwareConcurrency: input.hardwareConcurrency,
+      touchPoints: input.touchPoints,
+      visibilityChanges: input.visibilityChanges,
+      elapsedMs: input.elapsedMs,
+      fingerprintCapabilities: input.fingerprintCapabilities,
+    };
+    const baseScoreDetails = scoreEnvironmentDetails(signals);
+    const report = input.wasmReport;
+    const reportValid = Boolean(
+      input.wasmAvailable &&
+      report?.version === 2 &&
+      report.score === baseScoreDetails.score &&
+      report.deductionMask === scoreDeductionMask(baseScoreDetails),
+    );
+    const integrity = await ensureIntegrityChallenge(session.id, session.integrity_challenge);
+    const wasmIntegrityVerified = Boolean(
+      reportValid && report && validateIntegrityEvidence(
+        integrity.challenge,
+        report.fingerprint,
+        report.integrity as IntegrityEvidence,
+        input.visibilityChanges,
+      ),
+    );
+    const machineFingerprint = wasmIntegrityVerified && report
+      ? scopeMachineFingerprint(session.site_id, report.fingerprint)
+      : null;
+    const additions: ScoreDeduction[] = [];
+    if (input.wasmAvailable && !reportValid) additions.push({ factor: "wasm_report_invalid", points: 25 });
+    if (report && (report.score !== baseScoreDetails.score || report.deductionMask !== scoreDeductionMask(baseScoreDetails))) {
+      additions.push({ factor: "wasm_score_mismatch", points: 30 });
+    }
+    if (!wasmIntegrityVerified) additions.push({ factor: "integrity_challenge_failed", points: 30 });
+    additions.push(...await fingerprintHistoryDeductions(session.site_id, session.id, machineFingerprint));
+    const scoreDetails = withDeductions(baseScoreDetails, additions);
     const riskScore = scoreDetails.score;
+    const persisted = await prisma.widgetSession.updateMany({
+      where: { id: session.id, state: "pending", integrity_challenge: integrity.serialized },
+      data: {
+        risk_score: riskScore,
+        machine_fingerprint: machineFingerprint,
+        fingerprint_version: report?.version,
+        fingerprint_capabilities: input.fingerprintCapabilities,
+        wasm_score: report?.score,
+        wasm_integrity_verified: wasmIntegrityVerified,
+        integrity_challenge: null,
+      },
+    });
+    if (persisted.count !== 1) {
+      res.status(409).json({ error: "SESSION_ALREADY_COMPLETED" });
+      return;
+    }
     const decision = session.test_challenge_type === "text" || session.test_challenge_type === "slider"
       ? session.test_challenge_type
       : selectChallenge(session.level, riskScore, session.credential_failure);
-    const diagnostic = session.test_challenge_type ? { diagnostic: scoreDetails } : {};
+    const diagnostic = session.test_challenge_type ? {
+      diagnostic: {
+        ...scoreDetails,
+        machineFingerprint,
+        fingerprintVersion: report?.version || null,
+        fingerprintCapabilities: input.fingerprintCapabilities || 0,
+        wasmIntegrityVerified,
+      },
+    } : {};
     if (decision === "pass") {
       const completionToken = await completeSession(session.id, undefined, riskScore);
       if (!completionToken) {

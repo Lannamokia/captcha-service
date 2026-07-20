@@ -6,6 +6,7 @@ RUN npm ci
 COPY prisma ./prisma
 COPY server ./server
 COPY web ./web
+COPY wasm ./wasm
 RUN npm run build
 
 FROM node:22-bookworm-slim AS runtime

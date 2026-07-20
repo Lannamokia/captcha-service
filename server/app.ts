@@ -610,15 +610,31 @@ export function createApp() {
       valid,
     }));
     if (!valid) {
+      const attemptsRemaining = Math.max(0, MAX_CHALLENGE_ATTEMPTS - session.challenge_attempts - 1);
+      let retryMotionMap: number[] | undefined;
+      if (session.challenge_type === "slider" && session.slider_target !== null && attemptsRemaining > 0) {
+        const currentMotionMap = JSON.parse(session.slider_motion_profile || "[]") as number[];
+        if (currentMotionMap.length >= 2) {
+          retryMotionMap = createMotionMap(session.slider_target, currentMotionMap.length - 1);
+        }
+      }
       await prisma.widgetSession.updateMany({
         where: { id: session.id, state: "pending" },
-        data: { challenge_digest: summary },
+        data: {
+          challenge_digest: summary,
+          ...(retryMotionMap ? { slider_motion_profile: JSON.stringify(retryMotionMap) } : {}),
+        },
       });
       await prisma.widgetSession.updateMany({
         where: { id: session.id, state: "pending", challenge_attempts: { gte: MAX_CHALLENGE_ATTEMPTS } },
         data: { state: "failed" },
       });
-      res.status(400).json({ success: false, error: "CHALLENGE_REJECTED" });
+      res.status(400).json({
+        success: false,
+        error: "CHALLENGE_REJECTED",
+        attemptsRemaining,
+        ...(retryMotionMap ? { motionMap: retryMotionMap } : {}),
+      });
       return;
     }
     const completionToken = await completeSession(session.id, summary);
@@ -777,7 +793,7 @@ export function createApp() {
       res.status(410).type("text/plain").send("Captcha session expired");
       return;
     }
-    res.setHeader("Content-Security-Policy", `default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self'; ${frameAncestors(session.parent_origin)}; base-uri 'none'; form-action 'self'`);
+    res.setHeader("Content-Security-Policy", `default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; font-src 'self' data:; img-src 'self' data: blob:; connect-src 'self'; ${frameAncestors(session.parent_origin)}; base-uri 'none'; form-action 'self'`);
     res.setHeader("Referrer-Policy", "no-referrer");
     res.setHeader("Cache-Control", "no-store");
     res.sendFile(path.join(webRoot, "index.html"));

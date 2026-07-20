@@ -20,6 +20,7 @@ export default defineConfig(({ command }) => ({
             deadCodeInjection: false,
             identifierNamesGenerator: "hexadecimal",
             rotateStringArray: true,
+            reservedStrings: ["^__VITE_(?:ASSET|PUBLIC_ASSET)__.*__$"],
             selfDefending: false,
             simplify: true,
             splitStrings: true,
@@ -36,6 +37,7 @@ export default defineConfig(({ command }) => ({
   build: {
     outDir: path.resolve(__dirname, "../dist/web"),
     emptyOutDir: true,
+    assetsInlineLimit: 0,
     sourcemap: false,
     minify: "esbuild",
   },

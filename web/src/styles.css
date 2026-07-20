@@ -17,6 +17,7 @@
 
 * { box-sizing: border-box; }
 body { margin: 0; min-width: 320px; min-height: 100vh; }
+body:has(.widget-shell) { min-width: 0; }
 button, input, textarea, select { font: inherit; letter-spacing: 0; }
 button { cursor: pointer; }
 button:disabled { cursor: not-allowed; opacity: .55; }
@@ -212,13 +213,15 @@ code, .eyebrow, .section-index, .widget-footer, .console-brand small, .nav-meta 
 .slider-piece-layer { filter: drop-shadow(0 2px 2px rgb(3 13 18 / .65)); will-change: transform; }
 .slider-control { height: 45px; display: grid; grid-template-columns: 45px 1fr; align-items: center; border: 1px solid var(--line); background: var(--surface); overflow: hidden; }
 .slider-arrow { align-self: stretch; display: grid; place-items: center; border-right: 1px solid var(--line); background: var(--paper); color: var(--brand-strong); font: 600 22px "IBM Plex Mono", monospace; }
-.captcha-slider { appearance: none; height: 43px; padding: 0 12px; border: 0; background: transparent; box-shadow: none; cursor: ew-resize; }
+.captcha-slider { appearance: none; width: 100%; min-width: 0; height: 43px; padding: 0 12px; border: 0; background: transparent; box-shadow: none; cursor: ew-resize; touch-action: none; }
+.captcha-slider:disabled { cursor: wait; opacity: .68; }
 .captcha-slider:focus { box-shadow: inset 0 0 0 2px color-mix(in srgb, var(--brand) 35%, transparent); }
 .captcha-slider::-webkit-slider-runnable-track { height: 6px; background: #d2dadd; border: 1px solid #bcc7cb; }
 .captcha-slider::-webkit-slider-thumb { appearance: none; width: 34px; height: 32px; margin-top: -14px; border: 1px solid #87979e; border-radius: 3px; background: var(--paper); box-shadow: 0 2px 5px rgb(23 32 42 / .2); }
 .captcha-slider::-moz-range-track { height: 6px; background: #d2dadd; border: 1px solid #bcc7cb; }
 .captcha-slider::-moz-range-thumb { width: 34px; height: 32px; border: 1px solid #87979e; border-radius: 3px; background: var(--paper); box-shadow: 0 2px 5px rgb(23 32 42 / .2); }
 .widget-actions { display: flex; align-items: center; justify-content: space-between; }
+.slider-verifying { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 10px; }
 .inline-error { text-align: center; margin-top: 8px; }
 .widget-footer { display: flex; justify-content: space-between; border-top: 1px solid var(--line); margin-top: 13px; padding-top: 8px; color: var(--muted); font-size: 8px; }
 

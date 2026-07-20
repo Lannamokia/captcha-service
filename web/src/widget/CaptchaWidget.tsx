@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties } from "react";
 import { CheckCircle2, LoaderCircle, RefreshCw, ShieldCheck, SlidersHorizontal, Type } from "lucide-react";
-import { api } from "../api";
+import { ApiError, api } from "../api";
 import { collectBrowserRisk, type IntegrityChallenge } from "./browser-risk";
 
 type Bootstrap = {
@@ -43,8 +43,11 @@ export function CaptchaWidget() {
   const [error, setError] = useState("");
   const pointsRef = useRef<Array<{ x: number; y: number; t: number }>>([]);
   const startRef = useRef(0);
+  const draggingPointerRef = useRef<number | null>(null);
+  const sliderSubmittingRef = useRef(false);
   const visibilityChanges = useRef(0);
   const rootRef = useRef<HTMLDivElement>(null);
+  const [sliderSubmitting, setSliderSubmitting] = useState(false);
 
   function visualSliderPosition(value: number, motionMap: number[]): number {
     if (motionMap.length < 2) return value;
@@ -140,6 +143,9 @@ export function CaptchaWidget() {
         setTextAnswer("");
         setAnswer(0);
         pointsRef.current = [];
+        draggingPointerRef.current = null;
+        sliderSubmittingRef.current = false;
+        setSliderSubmitting(false);
       }
     } catch {
       setError("验证服务暂时不可用");
@@ -148,7 +154,13 @@ export function CaptchaWidget() {
     }
   }
 
-  async function submit() {
+  async function submit(sliderAttempt?: { answer: number; trajectory: Array<{ x: number; y: number; t: number }> }) {
+    const submittingSlider = phase === "slider";
+    if (submittingSlider) {
+      if (sliderSubmittingRef.current) return;
+      sliderSubmittingRef.current = true;
+      setSliderSubmitting(true);
+    }
     setError("");
     try {
       const result = await api<{ success: boolean; completionToken: string }>(
@@ -156,16 +168,37 @@ export function CaptchaWidget() {
         {
           method: "POST",
           body: JSON.stringify({
-            answer: phase === "text" ? textAnswer : answer,
-            trajectory: phase === "slider" ? pointsRef.current : undefined,
+            answer: phase === "text" ? textAnswer : sliderAttempt?.answer ?? answer,
+            trajectory: submittingSlider ? sliderAttempt?.trajectory ?? pointsRef.current : undefined,
           }),
         },
         tokenRef.current
       );
       setPhase("complete");
       post("captcha.completed", { token: result.completionToken });
-    } catch {
-      setError("验证未通过，请重试");
+    } catch (requestError) {
+      if (submittingSlider) {
+        const retryMap = requestError instanceof ApiError && Array.isArray(requestError.payload.motionMap)
+          ? requestError.payload.motionMap.filter((value): value is number => typeof value === "number")
+          : null;
+        if (retryMap && challenge?.decision === "slider" && retryMap.length === challenge.sliderMax + 1) {
+          setChallenge((current) => current?.decision === "slider" ? { ...current, motionMap: retryMap } : current);
+        }
+        setAnswer(0);
+        pointsRef.current = [];
+        draggingPointerRef.current = null;
+        const attemptsRemaining = requestError instanceof ApiError && typeof requestError.payload.attemptsRemaining === "number"
+          ? requestError.payload.attemptsRemaining
+          : null;
+        setError(attemptsRemaining === 0 ? "尝试次数已用尽" : "验证未通过，请重新拖动");
+      } else {
+        setError("验证未通过，请重试");
+      }
+    } finally {
+      if (submittingSlider) {
+        sliderSubmittingRef.current = false;
+        setSliderSubmitting(false);
+      }
     }
   }
 
@@ -222,24 +255,44 @@ export function CaptchaWidget() {
               min={0}
               max={challenge.sliderMax}
               value={answer}
+              disabled={sliderSubmitting}
+              aria-busy={sliderSubmitting}
               aria-label="向右拖动拼图块"
               onPointerDown={(event) => {
+                if (sliderSubmittingRef.current) return;
+                event.currentTarget.setPointerCapture(event.pointerId);
+                draggingPointerRef.current = event.pointerId;
+                setError("");
                 startRef.current = performance.now();
                 pointsRef.current = [{ x: Number(event.currentTarget.value), y: event.clientY, t: 0 }];
               }}
               onPointerMove={(event) => {
-                if (!event.buttons) return;
-                pointsRef.current.push({ x: Number(event.currentTarget.value), y: event.clientY, t: performance.now() - startRef.current });
+                if (draggingPointerRef.current !== event.pointerId) return;
+                const point = { x: Number(event.currentTarget.value), y: event.clientY, t: performance.now() - startRef.current };
+                if (point.t > (pointsRef.current.at(-1)?.t ?? -1)) pointsRef.current.push(point);
               }}
               onPointerUp={(event) => {
-                pointsRef.current.push({ x: Number(event.currentTarget.value), y: event.clientY, t: performance.now() - startRef.current });
+                if (draggingPointerRef.current !== event.pointerId) return;
+                const releasedAnswer = Number(event.currentTarget.value);
+                const finalPoint = { x: releasedAnswer, y: event.clientY, t: performance.now() - startRef.current };
+                if (finalPoint.t > (pointsRef.current.at(-1)?.t ?? -1)) pointsRef.current.push(finalPoint);
+                if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId);
+                draggingPointerRef.current = null;
+                setAnswer(releasedAnswer);
+                void submit({ answer: releasedAnswer, trajectory: [...pointsRef.current] });
+              }}
+              onPointerCancel={(event) => {
+                if (draggingPointerRef.current !== event.pointerId) return;
+                draggingPointerRef.current = null;
+                pointsRef.current = [];
+                setAnswer(0);
               }}
               onChange={(event) => setAnswer(Number(event.target.value))}
             />
           </div>
           <div className="widget-actions">
             <button className="link-button" onClick={() => void fallback()}>文字验证</button>
-            <button className="primary-button" onClick={() => void submit()}>提交验证</button>
+            {sliderSubmitting && <span className="slider-verifying"><LoaderCircle size={14} className="spin" /> 正在验证</span>}
           </div>
         </section>
       )}

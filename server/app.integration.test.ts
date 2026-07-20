@@ -235,6 +235,10 @@ describe("captcha service HTTP protocol", () => {
     const iframeUrl = new URL(sessionResponse.body.iframeUrl);
     const sessionId = iframeUrl.searchParams.get("session")!;
     const widgetToken = new URLSearchParams(iframeUrl.hash.slice(1)).get("token")!;
+    const widgetDocument = await request(app).get(`${iframeUrl.pathname}${iframeUrl.search}`);
+    expect(widgetDocument.status).toBe(200);
+    expect(widgetDocument.headers["content-security-policy"]).toContain("font-src 'self' data:");
+    expect(widgetDocument.headers["content-security-policy"]).toContain("script-src 'self' 'wasm-unsafe-eval'");
     const bootstrap = await request(app)
       .get(`/v1/widget/sessions/${sessionId}/bootstrap`)
       .set("authorization", `Bearer ${widgetToken}`);
@@ -345,7 +349,25 @@ describe("captcha service HTTP protocol", () => {
     expect(evaluate.body.motionMap).toHaveLength(evaluate.body.sliderMax + 1);
     const pending = await prisma.widgetSession.findUnique({ where: { id: sessionId } });
     const target = pending!.slider_target!;
-    const rawTarget = rawPositionForTarget(evaluate.body.motionMap as number[], target);
+    const initialMotionMap = evaluate.body.motionMap as number[];
+    const initialRawTarget = rawPositionForTarget(initialMotionMap, target);
+    const rejectedTrajectory = Array.from({ length: 9 }, (_, index) => ({
+      x: Math.round(initialRawTarget * (index / 8)),
+      y: 10,
+      t: index * 80,
+    }));
+    const rejected = await request(app)
+      .post(`/v1/widget/sessions/${sessionId}/verify`)
+      .set("authorization", `Bearer ${widgetToken}`)
+      .send({ answer: initialRawTarget, trajectory: rejectedTrajectory });
+    expect(rejected.status).toBe(400);
+    expect(rejected.body.attemptsRemaining).toBe(4);
+    expect(rejected.body.motionMap).toHaveLength(evaluate.body.sliderMax + 1);
+    expect(rejected.body.motionMap).not.toEqual(initialMotionMap);
+    const rotated = await prisma.widgetSession.findUniqueOrThrow({ where: { id: sessionId } });
+    expect(JSON.parse(rotated.slider_motion_profile!)).toEqual(rejected.body.motionMap);
+
+    const rawTarget = rawPositionForTarget(rejected.body.motionMap as number[], target);
     const fractions = [0, 0.04, 0.12, 0.25, 0.42, 0.61, 0.78, 0.9, 0.97, 1];
     const trajectory = fractions.map((fraction, index) => ({
       x: Math.round(rawTarget * fraction),
@@ -359,8 +381,8 @@ describe("captcha service HTTP protocol", () => {
     expect(verify.status).toBe(200);
     const stored = await prisma.widgetSession.findUnique({ where: { id: sessionId } });
     expect(stored?.challenge_digest).toMatch(/^[A-Za-z0-9_-]{43}$/);
-    expect(stored?.challenge_attempts).toBe(1);
-    expect(JSON.parse(stored!.slider_motion_profile!)).toEqual(evaluate.body.motionMap);
+    expect(stored?.challenge_attempts).toBe(2);
+    expect(JSON.parse(stored!.slider_motion_profile!)).toEqual(rejected.body.motionMap);
     expect(stored?.machine_fingerprint).toMatch(/^[A-Za-z0-9_-]{43}$/);
     expect(stored?.fingerprint_version).toBe(2);
     expect(stored?.fingerprint_capabilities).toBe(7);

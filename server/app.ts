@@ -13,7 +13,6 @@ import { challengeDigest, digest, encryptSecret, opaqueToken, safeEqual } from "
 import { type RawRequest, requireSiteSignature } from "./hmac.js";
 import {
   analyzeTrajectory,
-  randomSliderTarget,
   randomTextAnswer,
   isTextChallenge,
   scoreEnvironmentDetails,
@@ -22,6 +21,8 @@ import {
   type TrajectoryPoint,
 } from "./engine.js";
 import { renderCaptchaPng } from "./captcha-image.js";
+import { renderSliderPuzzle } from "./puzzle-image.js";
+import { createMotionMap, mapMotionPosition } from "./motion-profile.js";
 import { pingNonceStore } from "./nonce-store.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -62,8 +63,7 @@ const verifyInput = z.object({
   trajectory: z.array(z.object({ x: z.number(), y: z.number(), t: z.number() })).max(500).optional(),
 });
 
-const assetCreateInput = z.discriminatedUnion("kind", [
-  z.object({
+const textAssetInput = z.object({
     kind: z.literal("text_wordlist"),
     label: z.string().trim().min(1).max(100),
     payload: z.string().min(1).max(100_000).refine(
@@ -73,17 +73,23 @@ const assetCreateInput = z.discriminatedUnion("kind", [
       },
       "Text wordlists must contain one six-character uppercase alphanumeric challenge per line, with at least one letter and one digit",
     ),
-  }),
-  z.object({
-    kind: z.literal("slider_background"),
-    label: z.string().trim().min(1).max(100),
-    payload: z.string().min(1).max(100_000).regex(/^data:image\/(?:png|jpeg|webp);base64,[A-Za-z0-9+/=]+$/),
-  }),
-]);
+  });
+
+const sliderAssetInput = z.object({
+  kind: z.literal("slider_background"),
+  label: z.string().trim().min(1).max(100),
+  payload: z.string().min(1).max(1_000_000).regex(/^data:image\/(?:png|jpeg|webp);base64,[A-Za-z0-9+/=]+$/),
+});
+
+const assetCreateInput = z.discriminatedUnion("kind", [textAssetInput, sliderAssetInput]);
+
+const assetBatchInput = z.object({
+  assets: z.array(sliderAssetInput).min(1).max(40),
+}).refine((value) => value.assets.reduce((sum, asset) => sum + asset.payload.length, 0) <= 14_000_000, "Batch payload is too large");
 
 const assetUpdateInput = z.object({
   label: z.string().trim().min(1).max(100).optional(),
-  payload: z.string().min(1).max(100_000).optional(),
+  payload: z.string().min(1).max(1_000_000).optional(),
   active: z.boolean().optional(),
 }).refine((value) => value.label !== undefined || value.payload !== undefined || value.active !== undefined, "At least one field is required");
 
@@ -207,7 +213,7 @@ export function createApp() {
   app.set("trust proxy", 1);
   app.use(helmet({ contentSecurityPolicy: false, frameguard: false, referrerPolicy: { policy: "no-referrer" } }));
   app.use(express.json({
-    limit: "128kb",
+    limit: "16mb",
     verify: (req, _res, buffer) => { (req as RawRequest).rawBody = Buffer.from(buffer); },
   }));
 
@@ -357,17 +363,31 @@ export function createApp() {
       res.json({ decision, imageData: challenge.imageData, parentOrigin: session.parent_origin, ...diagnostic });
       return;
     }
-    const target = randomSliderTarget();
-    const backgroundImage = await sliderBackground();
+    const puzzle = await renderSliderPuzzle(await sliderBackground());
+    const motionMap = createMotionMap(puzzle.target, puzzle.sliderMax);
     const updated = await prisma.widgetSession.updateMany({
       where: { id: session.id, state: "pending", challenge_attempts: { lt: MAX_CHALLENGE_ATTEMPTS } },
-      data: { risk_score: riskScore, challenge_type: "slider", slider_target: target },
+      data: {
+        risk_score: riskScore,
+        challenge_type: "slider",
+        slider_target: puzzle.target,
+        slider_motion_profile: JSON.stringify(motionMap),
+      },
     });
     if (updated.count !== 1) {
       res.status(409).json({ error: "CHALLENGE_NOT_AVAILABLE" });
       return;
     }
-    res.json({ decision, target, seed: opaqueToken(8), backgroundImage, parentOrigin: session.parent_origin, ...diagnostic });
+    res.json({
+      decision,
+      backgroundImage: puzzle.backgroundImage,
+      pieceImage: puzzle.pieceImage,
+      sliderMax: puzzle.sliderMax,
+      motionMap,
+      holeCount: puzzle.holeCount,
+      parentOrigin: session.parent_origin,
+      ...diagnostic,
+    });
   }));
 
   app.post("/v1/widget/sessions/:id/verify", asyncRoute(async (req, res) => {
@@ -390,8 +410,13 @@ export function createApp() {
     if (session.challenge_type === "text" && session.challenge_answer_digest) {
       valid = safeEqual(challengeDigest(String(input.answer).trim().toUpperCase()), session.challenge_answer_digest);
     } else if (session.challenge_type === "slider" && session.slider_target !== null && input.trajectory) {
+      const motionMap = JSON.parse(session.slider_motion_profile || "[]") as number[];
+      const visualTrajectory = (input.trajectory as TrajectoryPoint[]).map((point) => ({
+        ...point,
+        x: mapMotionPosition(point.x, motionMap),
+      }));
       valid = Number(input.answer) === Math.round(input.trajectory.at(-1)?.x || -1) &&
-        analyzeTrajectory(input.trajectory as TrajectoryPoint[], session.slider_target);
+        analyzeTrajectory(visualTrajectory, session.slider_target);
     }
     const summary = digest(JSON.stringify({
       type: session.challenge_type,
@@ -429,7 +454,7 @@ export function createApp() {
     const challenge = await textChallenge();
     const updated = await prisma.widgetSession.updateMany({
       where: { id: session.id, state: "pending" },
-      data: { challenge_type: "text", challenge_answer_digest: challenge.answerDigest, slider_target: null },
+      data: { challenge_type: "text", challenge_answer_digest: challenge.answerDigest, slider_target: null, slider_motion_profile: null },
     });
     if (updated.count !== 1) {
       res.status(409).json({ error: "CHALLENGE_NOT_AVAILABLE" });
@@ -524,6 +549,23 @@ export function createApp() {
     });
     res.status(201).json(asset);
   }));
+  app.post("/admin-api/assets/batch", requireAdmin, asyncRoute(async (req: AdminRequest, res) => {
+    const input = assetBatchInput.parse(req.body);
+    const assets = await prisma.$transaction(async (transaction) => {
+      const created = await transaction.challengeAsset.createManyAndReturn({ data: input.assets });
+      await transaction.securityEvent.create({
+        data: {
+          action: "asset.batch_create",
+          metadata: JSON.stringify({ actor: req.admin!.username, count: created.length, assetIds: created.map((asset) => asset.id) }),
+        },
+      });
+      return created;
+    }, { maxWait: 5_000, timeout: 30_000 });
+    res.status(201).json({
+      assets: assets.map(({ payload: _payload, ...asset }) => asset),
+      count: assets.length,
+    });
+  }));
   app.put("/admin-api/assets/:id", requireAdmin, asyncRoute(async (req: AdminRequest, res) => {
     const input = assetUpdateInput.parse(req.body);
     const id = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
@@ -550,7 +592,7 @@ export function createApp() {
       res.status(410).type("text/plain").send("Captcha session expired");
       return;
     }
-    res.setHeader("Content-Security-Policy", `default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self'; ${frameAncestors(session.parent_origin)}; base-uri 'none'; form-action 'self'`);
+    res.setHeader("Content-Security-Policy", `default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self'; ${frameAncestors(session.parent_origin)}; base-uri 'none'; form-action 'self'`);
     res.setHeader("Referrer-Policy", "no-referrer");
     res.setHeader("Cache-Control", "no-store");
     res.sendFile(path.join(webRoot, "index.html"));

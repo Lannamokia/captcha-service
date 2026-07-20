@@ -29,6 +29,14 @@ function signatureHeaders(
   };
 }
 
+function rawPositionForTarget(motionMap: number[], target: number): number {
+  let closest = 0;
+  for (let index = 1; index < motionMap.length; index += 1) {
+    if (Math.abs(motionMap[index] - target) < Math.abs(motionMap[closest] - target)) closest = index;
+  }
+  return closest;
+}
+
 async function setupSite() {
   const setup = await request(app).post("/admin-api/setup").send({
     username: "operator",
@@ -279,22 +287,46 @@ describe("captcha service HTTP protocol", () => {
       });
     expect(evaluate.status).toBe(200);
     expect(evaluate.body.decision).toBe("slider");
-    expect(evaluate.body.backgroundImage).toBe(background);
-    const target = evaluate.body.target as number;
+    expect(evaluate.body.backgroundImage).toMatch(/^data:image\/webp;base64,/);
+    expect(evaluate.body.pieceImage).toMatch(/^data:image\/png;base64,/);
+    expect(evaluate.body.holeCount).toBeGreaterThanOrEqual(3);
+    expect(evaluate.body.target).toBeUndefined();
+    expect(evaluate.body.motionMap).toHaveLength(evaluate.body.sliderMax + 1);
+    const pending = await prisma.widgetSession.findUnique({ where: { id: sessionId } });
+    const target = pending!.slider_target!;
+    const rawTarget = rawPositionForTarget(evaluate.body.motionMap as number[], target);
     const fractions = [0, 0.04, 0.12, 0.25, 0.42, 0.61, 0.78, 0.9, 0.97, 1];
     const trajectory = fractions.map((fraction, index) => ({
-      x: Math.round(target * fraction),
+      x: Math.round(rawTarget * fraction),
       y: 10 + (index % 3),
       t: index * 100,
     }));
     const verify = await request(app)
       .post(`/v1/widget/sessions/${sessionId}/verify`)
       .set("authorization", `Bearer ${widgetToken}`)
-      .send({ answer: target, trajectory });
+      .send({ answer: rawTarget, trajectory });
     expect(verify.status).toBe(200);
     const stored = await prisma.widgetSession.findUnique({ where: { id: sessionId } });
     expect(stored?.challenge_digest).toMatch(/^[A-Za-z0-9_-]{43}$/);
     expect(stored?.challenge_attempts).toBe(1);
+    expect(JSON.parse(stored!.slider_motion_profile!)).toEqual(evaluate.body.motionMap);
+  });
+
+  it("creates slider background assets through the authenticated batch endpoint", async () => {
+    const { adminToken } = await setupSite();
+    const image = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
+    const response = await request(app)
+      .post("/admin-api/assets/batch")
+      .set("authorization", `Bearer ${adminToken}`)
+      .send({ assets: [
+        { kind: "slider_background", label: "Landscape A", payload: image },
+        { kind: "slider_background", label: "Landscape B", payload: image },
+      ] });
+    expect(response.status).toBe(201);
+    expect(response.body.count).toBe(2);
+    expect(response.body.assets).toHaveLength(2);
+    expect(await prisma.challengeAsset.count({ where: { kind: "slider_background" } })).toBe(2);
+    expect(await prisma.securityEvent.findFirst({ where: { action: "asset.batch_create" } })).not.toBeNull();
   });
 
   it("switches a slider session to the accessible text fallback", async () => {
@@ -367,11 +399,14 @@ describe("captcha service HTTP protocol", () => {
 
       let verifyBody: { answer: string | number; trajectory?: Array<{ x: number; y: number; t: number }> } = { answer: "a2b3c4" };
       if (challengeType === "slider") {
-        const target = evaluate.body.target as number;
+        expect(evaluate.body.target).toBeUndefined();
+        const pending = await prisma.widgetSession.findUnique({ where: { id: sessionId } });
+        const target = pending!.slider_target!;
+        const rawTarget = rawPositionForTarget(evaluate.body.motionMap as number[], target);
         const fractions = [0, 0.04, 0.12, 0.25, 0.42, 0.61, 0.78, 0.9, 0.97, 1];
         verifyBody = {
-          answer: target,
-          trajectory: fractions.map((fraction, index) => ({ x: Math.round(target * fraction), y: 10 + (index % 3), t: index * 100 })),
+          answer: rawTarget,
+          trajectory: fractions.map((fraction, index) => ({ x: Math.round(rawTarget * fraction), y: 10 + (index % 3), t: index * 100 })),
         };
       }
       const verify = await request(app)

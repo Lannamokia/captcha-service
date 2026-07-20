@@ -98,5 +98,5 @@ export function randomTextAnswer(candidates: string[] = []): string {
 }
 
 export function randomSliderTarget(): number {
-  return crypto.randomInt(90, 235);
+  return crypto.randomInt(55, 106);
 }

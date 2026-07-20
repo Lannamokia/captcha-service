@@ -46,6 +46,7 @@ model WidgetSession {
   challenge_type           String?
   challenge_answer_digest  String?
   slider_target            Int?
+  slider_motion_profile    String?
   challenge_digest         String?
   challenge_attempts       Int      @default(0)
   completion_digest        String?  @unique

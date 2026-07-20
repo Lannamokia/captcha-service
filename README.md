@@ -20,9 +20,11 @@ The admin console also manages challenge assets and integration credentials:
 
 - Text wordlists contain one six-character uppercase alphanumeric value per line, with at least one letter and one digit. The asset editor can securely generate 100 unique entries in one click. Only active wordlists participate in challenge generation.
 - Slider backgrounds are PNG, JPEG, or WebP images uploaded as data URLs. Only active backgrounds are selected.
+- Slider challenges render one draggable piece over three or four randomized, differently shaped holes. Only one hole matches the piece. The server adds an `NX-Captcha` watermark, keeps the target displacement private, and validates movement through a per-session monotonic speed perturbation curve so trajectories cannot be replayed across sessions.
 - Disabling an asset removes it from new challenges without changing existing sessions. Site, secret, and asset changes create redacted security events.
 - Secret rotation requires an explicit acknowledgement in the console because the old secret becomes invalid immediately.
 - The credential test view signs the real HMAC session and redemption requests, runs either text recognition or slider interaction in the real widget, and reports the server-calculated browser trust score and deductions.
+- The local image workshop performs 2:1 visual cropping and WebP/JPEG compression in a transferable-memory Web Worker pool. Processed images can be exported or imported as `.nxcap` packages and uploaded in batches of up to 40 through `POST /admin-api/assets/batch`.
 
 ## Integration protocol
 

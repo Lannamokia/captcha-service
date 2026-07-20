@@ -18,6 +18,7 @@ import {
   Plus,
   RefreshCw,
   RotateCcw,
+  ScanLine,
   ServerCog,
   ShieldAlert,
   ShieldCheck,
@@ -28,8 +29,9 @@ import {
 } from "lucide-react";
 import { api, ApiError } from "../api";
 import { generateTextChallenges, sha256Base64Url, signedRequestHeaders } from "./credential-tools";
+import { AssetWorkshop } from "./AssetWorkshop";
 
-type View = "sites" | "assets" | "credentials" | "status";
+type View = "sites" | "assets" | "workshop" | "credentials" | "status";
 type Site = {
   id: string;
   name: string;
@@ -391,8 +393,8 @@ function Console({ token, onLogout }: { token: string; onLogout: () => void }) {
     }
   }
 
-  const title = view === "sites" ? "接入站点" : view === "assets" ? "挑战资产" : view === "credentials" ? "密钥测试" : "运行状态";
-  const eyebrow = view === "sites" ? "SITE REGISTRY" : view === "assets" ? "CHALLENGE LIBRARY" : view === "credentials" ? "CREDENTIAL LAB" : "SERVICE TELEMETRY";
+  const title = view === "sites" ? "接入站点" : view === "assets" ? "挑战资产" : view === "workshop" ? "图片工坊" : view === "credentials" ? "密钥测试" : "运行状态";
+  const eyebrow = view === "sites" ? "SITE REGISTRY" : view === "assets" ? "CHALLENGE LIBRARY" : view === "workshop" ? "LOCAL IMAGE PIPELINE" : view === "credentials" ? "CREDENTIAL LAB" : "SERVICE TELEMETRY";
 
   return (
     <main className="console-shell">
@@ -409,6 +411,7 @@ function Console({ token, onLogout }: { token: string; onLogout: () => void }) {
         <aside className="console-nav">
           <button className={view === "sites" ? "active" : ""} onClick={() => setView("sites")}><ServerCog size={18} /> 接入站点</button>
           <button className={view === "assets" ? "active" : ""} onClick={() => setView("assets")}><FileImage size={18} /> 挑战资产</button>
+          <button className={view === "workshop" ? "active" : ""} onClick={() => setView("workshop")}><ScanLine size={18} /> 图片工坊</button>
           <button className={view === "credentials" ? "active" : ""} onClick={() => setView("credentials")}><FlaskConical size={18} /> 密钥测试</button>
           <button className={view === "status" ? "active" : ""} onClick={() => setView("status")}><Activity size={18} /> 运行状态</button>
           <div className="nav-meta"><span>BUILD</span><b>1.0.0</b></div>
@@ -456,6 +459,8 @@ function Console({ token, onLogout }: { token: string; onLogout: () => void }) {
               </div>
             ))}
           </div>}
+
+          {view === "workshop" && <AssetWorkshop token={token} onUploaded={refresh} />}
 
           {view === "credentials" && (
             <div className="credential-workspace">
@@ -567,7 +572,7 @@ function Console({ token, onLogout }: { token: string; onLogout: () => void }) {
                 <small className="field-hint">每行一组六位大写字母与数字混合题目，自动生成会排除易混淆字符。</small>
               </label>
             ) : (
-              <label>背景图片<input type="file" accept="image/png,image/jpeg,image/webp" onChange={(event) => readSliderImage(event.target.files?.[0])} />{assetPayload && <img className="asset-upload-preview" src={assetPayload} alt="待保存的滑块背景" />}<small className="field-hint">PNG、JPEG 或 WebP，编码后不超过 100 KB。</small></label>
+              <label>背景图片<input type="file" accept="image/png,image/jpeg,image/webp" onChange={(event) => readSliderImage(event.target.files?.[0])} />{assetPayload && <img className="asset-upload-preview" src={assetPayload} alt="待保存的滑块背景" />}<small className="field-hint">PNG、JPEG 或 WebP，建议使用图片工坊裁剪压缩后批量上传。</small></label>
             )}
             {actionError && <p className="form-error">{actionError}</p>}
             <button className="primary-button" disabled={!assetLabel.trim() || !assetPayload.trim()} onClick={() => void saveAsset()}><Check size={17} /> 保存资产</button>

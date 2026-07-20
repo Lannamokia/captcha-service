@@ -19,7 +19,7 @@ type Diagnostic = {
 
 type Challenge = (
   | { decision: "text"; imageData: string; parentOrigin: string }
-  | { decision: "slider"; target: number; seed: string; backgroundImage?: string; parentOrigin: string }
+  | { decision: "slider"; backgroundImage: string; pieceImage: string; sliderMax: number; motionMap: number[]; holeCount: number; parentOrigin: string }
 ) & { diagnostic?: Diagnostic };
 
 type MessageEventName = "captcha.ready" | "captcha.resize" | "captcha.evaluated" | "captcha.completed" | "captcha.expired" | "captcha.error";
@@ -38,6 +38,15 @@ export function CaptchaWidget() {
   const startRef = useRef(0);
   const visibilityChanges = useRef(0);
   const rootRef = useRef<HTMLDivElement>(null);
+
+  function visualSliderPosition(value: number, motionMap: number[]): number {
+    if (motionMap.length < 2) return value;
+    const clamped = Math.max(0, Math.min(motionMap.length - 1, value));
+    const lower = Math.floor(clamped);
+    const upper = Math.min(motionMap.length - 1, lower + 1);
+    const fraction = clamped - lower;
+    return motionMap[lower] + (motionMap[upper] - motionMap[lower]) * fraction;
+  }
 
   const post = useCallback((event: MessageEventName, payload: Record<string, unknown> = {}) => {
     if (!bootstrap) return;
@@ -190,33 +199,40 @@ export function CaptchaWidget() {
       )}
       {phase === "slider" && challenge?.decision === "slider" && (
         <section className="challenge-block">
-          <div className="challenge-label"><SlidersHorizontal size={15} /> 滑块验证</div>
-          <div className="slider-scene" style={{
-            "--target-position": `${(challenge.target / 260) * 100}%`,
-            ...(challenge.backgroundImage ? { backgroundImage: `url(${challenge.backgroundImage})` } : {}),
-          } as CSSProperties}>
-            <span className="slider-target" />
+          <div className="challenge-label"><SlidersHorizontal size={15} /> 拖动拼图块到匹配缺口</div>
+          <div className="slider-scene">
+            <img className="slider-background" src={challenge.backgroundImage} alt="拼图验证背景" draggable={false} />
+            <img
+              className="slider-piece-layer"
+              src={challenge.pieceImage}
+              alt="待拖动拼图块"
+              draggable={false}
+              style={{ transform: `translateX(${(visualSliderPosition(answer, challenge.motionMap) / 320) * 100}%)` } as CSSProperties}
+            />
           </div>
-          <input
-            className="captcha-slider"
-            type="range"
-            min={0}
-            max={260}
-            value={answer}
-            aria-label="滑块"
-            onPointerDown={(event) => {
-              startRef.current = performance.now();
-              pointsRef.current = [{ x: answer, y: event.clientY, t: 0 }];
-            }}
-            onPointerMove={(event) => {
-              if (!event.buttons) return;
-              pointsRef.current.push({ x: Number(event.currentTarget.value), y: event.clientY, t: performance.now() - startRef.current });
-            }}
-            onPointerUp={(event) => {
-              pointsRef.current.push({ x: Number(event.currentTarget.value), y: event.clientY, t: performance.now() - startRef.current });
-            }}
-            onChange={(event) => setAnswer(Number(event.target.value))}
-          />
+          <div className="slider-control">
+            <span className="slider-arrow" aria-hidden="true">&#8594;</span>
+            <input
+              className="captcha-slider"
+              type="range"
+              min={0}
+              max={challenge.sliderMax}
+              value={answer}
+              aria-label="向右拖动拼图块"
+              onPointerDown={(event) => {
+                startRef.current = performance.now();
+                pointsRef.current = [{ x: Number(event.currentTarget.value), y: event.clientY, t: 0 }];
+              }}
+              onPointerMove={(event) => {
+                if (!event.buttons) return;
+                pointsRef.current.push({ x: Number(event.currentTarget.value), y: event.clientY, t: performance.now() - startRef.current });
+              }}
+              onPointerUp={(event) => {
+                pointsRef.current.push({ x: Number(event.currentTarget.value), y: event.clientY, t: performance.now() - startRef.current });
+              }}
+              onChange={(event) => setAnswer(Number(event.target.value))}
+            />
+          </div>
           <div className="widget-actions">
             <button className="link-button" onClick={() => void fallback()}>文字验证</button>
             <button className="primary-button" onClick={() => void submit()}>提交验证</button>
